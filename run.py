@@ -41,7 +41,6 @@ elif model_name == 'qwen':
 """
 data
 """
-
 # Create date range from June 2024 to November 2024
 date_range = pd.date_range(start="2024-06-01", end="2024-12-01", freq='MS')
 
