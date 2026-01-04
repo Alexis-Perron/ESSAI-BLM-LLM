@@ -10,32 +10,22 @@ from pydantic import BaseModel
 from tqdm import tqdm
 import argparse
 from datetime import datetime, timedelta
+from keys import gpt_key
 class ResearchPaperExtraction(BaseModel):
     expected_return: float
 
 # make model_name arg parser
 parser = argparse.ArgumentParser()
-parser.add_argument("--model_name", type=str, default="llama")
+parser.add_argument("--model_name", type=str, default="gpt")
 args = parser.parse_args()
 
 """
 model
 """
 model_name = args.model_name
-if model_name == 'llama':
+if model_name == 'gpt':
     client = OpenAI(
-        base_url=f"https://{YOUR_API_ENDPOINT}", 
-        api_key="-",
-    )
-elif model_name == 'gemma':
-    client = OpenAI(
-        base_url=f"https://{YOUR_API_ENDPOINT}",
-        api_key="-",
-    )
-elif model_name == 'qwen':
-    client = OpenAI(
-        base_url=f"https://{YOUR_API_ENDPOINT}", 
-        api_key="-",
+        api_key=gpt_key
     )
 
 """
@@ -49,23 +39,29 @@ os.makedirs('yfinance', exist_ok=True)
 os.makedirs('responses', exist_ok=True)
 
 # 1. S&P500 ticker data
-url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-tables = pd.read_html(url)[0]  # Wikipedia table data
-sp500_table = tables[['Symbol', 'Security', 'GICS Sector', 'GICS Sub-Industry']]
+# url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+# tables = pd.read_html(url)[0]  # Wikipedia table data
+# sp500_table = tables[['Symbol', 'Security', 'GICS Sector', 'GICS Sub-Industry']]
+
+sp500_table = pd.read_csv('yfinance/filtered_sp500_data.csv')[['tic', 'conm', 'gics', 'sic', 'stock_ret']]
 
 for current_date in tqdm(date_range):
     month_start = current_date.strftime('%Y-%m-%d')
     month_end = (current_date + pd.DateOffset(months=1) - timedelta(days=1)).strftime('%Y-%m-%d')
     print(f"Processing data for {month_start} - {month_end}")
     
-    # Download data using yfinance
-    data = yf.download(sp500_table['Symbol'].tolist(), start=month_start, end=month_end)['Close']
+    # # Download data using yfinance
+    # data = yf.download(sp500_table['Symbol'].tolist(), start=month_start, end=month_end)['Close']
+    # Retrieve stock_ret from sp500_table for the given month
+    mask = (sp500_table['date_key'] >= month_start) & (sp500_table['date_key'] <= month_end)
+    data = sp500_table.loc[mask, ['tic', 'date_key', 'stock_ret']]
+
     # Save raw data
-    data.to_csv(f'yfinance/data_{month_start}_{month_end}.csv')
+    data.to_csv(f'yfinance/v2_data_{month_start}_{month_end}.csv')
     
     # Process returns
-    returns = data.pct_change().iloc[1:]
-    returns.to_csv(f'yfinance/returns_{month_start}_{month_end}.csv')
+    returns = data.pivot(index='date_key', columns='tic', values='stock_ret')
+    returns.to_csv(f'yfinance/v2_returns_{month_start}_{month_end}.csv')
     sp500_tickers = returns.columns
 
     # Organize data
@@ -73,9 +69,9 @@ for current_date in tqdm(date_range):
     for ticker in sp500_tickers:
         data_dict[ticker] = {
             'ticker': ticker,
-            'Security': sp500_table[sp500_table['Symbol'] == ticker]['Security'].values[0],
-            'GICS Sector': sp500_table[sp500_table['Symbol'] == ticker]['GICS Sector'].values[0],
-            'GICS Sub-Industry': sp500_table[sp500_table['Symbol'] == ticker]['GICS Sub-Industry'].values[0],
+            'Security': sp500_table[sp500_table['tic'] == ticker]['conm'].values[0],
+            'GICS Sector': sp500_table[sp500_table['tic'] == ticker]['gics'].values[0],
+            'GICS Sub-Industry': sp500_table[sp500_table['tic'] == ticker]['sic'].values[0],
             'pct_change': returns[ticker].tolist()
         }
 
