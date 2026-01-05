@@ -99,9 +99,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="gpt")
     parser.add_argument("--input_csv", type=str, default="yfinance/filtered_sp500_data.csv")
-    parser.add_argument("--start", type=str, default="2024-06-01")
-    parser.add_argument("--end", type=str, default="2024-12-01")
-    parser.add_argument("--n_samples", type=int, default=30)
+    parser.add_argument("--start", type=str, default="2021-01-01")
+    parser.add_argument("--end", type=str, default="2021-06-30")
+    parser.add_argument("--n_samples", type=int, default=5)
+    # parser.add_argument("--n_samples", type=int, default=30)
     args = parser.parse_args()
 
     if args.model_name != "gpt":
@@ -181,8 +182,10 @@ def main() -> None:
 
         # Only do inference on AAPL for debugging / credit saving
         for ticker in tqdm(sp500_tickers, leave=False):
-            if ticker != "AAPL":
-                continue
+
+            # Uncomment when debugging to limit to a single ticker
+            # if ticker != "AAPL":
+            #     continue
 
             user_prompt = make_user_prompt(ticker, data_dict[ticker])
 
@@ -190,11 +193,14 @@ def main() -> None:
             for _ in range(args.n_samples):
                 try:
                     response = client.responses.parse(
-                        model="gpt-4o-2024-08-06",
+                        # gpt-5 mini
+                        # model="gpt-4o-2024-08-06",
+                        model = "gpt-4o-mini",
+                        # model="gpt-5-mini",
                         instructions=system_prompt,
                         input=user_prompt,
                         text_format=ResearchPaperExtraction,
-                        temperature=1.0,
+                        temperature=0.5,
                     )
                     parsed = response.output_parsed
                     answers.append(float(parsed.expected_return))
