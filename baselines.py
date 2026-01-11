@@ -31,8 +31,8 @@ MASTER_PATH = Path("yfinance/filtered_sp500_data.csv")
 OUT_DIR = Path("responses_portfolios")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TRAIN_YEAR = 2023
-TRAIN_MONTHS = range(6, 12)      # June..November => 6 windows
+TRAIN_YEAR = 2021
+TRAIN_MONTHS = range(1, 7)      # June..November => 6 windows
 LOOKBACK_MONTHS = 12             # <-- KEY FIX for monthly data
 LAMBDA_PARAM = 0.1               # same spirit as original
 LONG_ONLY = True                 # no short-selling
@@ -171,6 +171,10 @@ def main():
         # Train = lookback months up to train_end; Test = next month
         train_df = df[(df["ym"] >= train_start_p) & (df["ym"] <= train_end_p)]
         test_df = df[df["ym"] == test_p]
+
+        # Force a single month-end Date for the test month (use the latest date present)
+        test_last_date = test_df["Date"].max()
+        test_df = test_df[test_df["Date"] == test_last_date]
 
         print("Train months expected:", train_start_p, "->", train_end_p)
         print("Train months present :", sorted(train_df["ym"].unique()))
