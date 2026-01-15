@@ -1,90 +1,76 @@
+import argparse
+import calendar
+import json
+from pathlib import Path
+from typing import Dict, Tuple, List
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-import json
-from pathlib import Path
 from tqdm import tqdm
 
 
-def black_litterman_LLM(data_dict, returns, tickers, market_equilibrium_return, tau):
-    """
-    Black-Litterman with LLM views (Q) as posterior expected returns.
-    - data_dict[ticker]["expected_return"] is assumed to be a list of samples.
-    """
-    Q = np.array([np.mean(data_dict[ticker]["expected_return"]) for ticker in tickers], dtype=float)
-    P = np.eye(len(tickers))
-    Omega = np.diag([np.var(data_dict[ticker]["expected_return"]) for ticker in tickers]).astype(float)
-
-    sigma = np.cov(returns.T)
-    tau_sigma = tau * sigma
-
-    inv_tau_sigma = np.linalg.pinv(tau_sigma)
-    inv_Omega = np.linalg.pinv(Omega)
-    M = np.linalg.pinv(inv_tau_sigma + P.T @ inv_Omega @ P)
-
-    posterior_returns = M @ (inv_tau_sigma @ market_equilibrium_return + P.T @ inv_Omega @ Q)
-
-    def portfolio_variance(w, cov_matrix):
-        return float(w.T @ cov_matrix @ w)
-
-    def objective_function(w, exp_rets, cov_matrix, risk_aversion=0.1):
-        # mean-variance (min var - lambda*mu)
-        return portfolio_variance(w, cov_matrix) - float(risk_aversion) * float(w @ exp_rets)
-
-    constraints = (
-        {"type": "eq", "fun": lambda x: np.sum(x) - 1.0},  # fully invested
-        {"type": "ineq", "fun": lambda x: x},              # long-only
-    )
-    bounds = tuple((0.0, 1.0) for _ in range(len(tickers)))
-
-    x0 = np.ones(len(tickers), dtype=float) / len(tickers)
-    result = minimize(
-        objective_function,
-        x0,
-        args=(posterior_returns, sigma),
-        constraints=constraints,
-        bounds=bounds,
-        options={"maxiter": 1000},
-    )
-
-    if not result.success:
-        # fallback: equal weights
-        return x0
-
-    return result.x
+# -------------------------
+# Ticker / date utils
+# -------------------------
+def _normalize_ticker(x: str) -> str:
+    s = str(x).strip().upper()
+    s = s.replace("-", ".")
+    return s
 
 
 def _parse_yyyymmdd_int(x):
-    """
-    filtered_sp500_data.csv uses 'date' like 20210129 (int).
-    """
+    """filtered_sp500_data.csv often has 'date' like 20210129 (int)."""
     if pd.isna(x):
         return pd.NaT
-    s = str(int(x)) if isinstance(x, (int, np.integer, float, np.floating)) and not pd.isna(x) else str(x)
+    try:
+        xi = int(x)
+        s = str(xi)
+    except Exception:
+        s = str(x)
     s_digits = "".join(ch for ch in s if ch.isdigit())
-    if len(s_digits) == 8:
+    if len(s_digits) >= 8:
+        s_digits = s_digits[:8]
         return pd.to_datetime(s_digits, format="%Y%m%d", errors="coerce")
     return pd.to_datetime(s, errors="coerce")
 
 
-def load_market_caps_from_filtered(filtered_csv_path: str, period_end_date: str) -> dict:
+def month_pairs(start: str, end: str) -> List[Tuple[str, str]]:
+    """Return list of (month_start, month_end) covering [start, end]."""
+    s = pd.to_datetime(start)
+    e = pd.to_datetime(end)
+    ms = pd.date_range(s, e, freq="MS")
+    out = []
+    for d in ms:
+        out.append((d.strftime("%Y-%m-%d"), (d + pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d")))
+    return out
+
+
+# -------------------------
+# Data loaders
+# -------------------------
+def load_market_caps_from_filtered(filtered_csv_path: str, period_end_date: str) -> Dict[str, float]:
     """
     Build a {tic: market_equity} snapshot using filtered_sp500_data.csv for the month of period_end_date.
+    Keeps last available row per ticker in that month.
     """
-    df = pd.read_csv(filtered_csv_path)
-    if "date" not in df.columns or "tic" not in df.columns or "market_equity" not in df.columns:
-        raise ValueError("filtered_sp500_data.csv must contain columns: date, tic, market_equity")
+    df = pd.read_csv(filtered_csv_path, low_memory=False)
+
+    required = {"date", "tic", "market_equity"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"filtered_sp500_data.csv missing columns: {sorted(missing)}")
 
     df["date_dt"] = df["date"].apply(_parse_yyyymmdd_int)
-    df["tic"] = df["tic"].astype(str)
+    df["tic"] = df["tic"].astype(str).map(_normalize_ticker)
+    df["market_equity"] = pd.to_numeric(df["market_equity"], errors="coerce")
 
     p = pd.Period(pd.to_datetime(period_end_date), freq="M")
     df = df[df["date_dt"].dt.to_period("M") == p].copy()
 
-    # Keep last available row per ticker (should already be 1 per month)
+    # Keep last available row per ticker in that month
     df = df.sort_values(["tic", "date_dt"]).drop_duplicates(subset=["tic"], keep="last")
 
-    # market_equity may have NaNs; drop them
     caps = (
         df[["tic", "market_equity"]]
         .dropna(subset=["tic", "market_equity"])
@@ -94,117 +80,389 @@ def load_market_caps_from_filtered(filtered_csv_path: str, period_end_date: str)
     return caps
 
 
-def process_period(start_date, end_date, tau, filtered_csv_path="yfinance/filtered_sp500_data.csv"):
+def load_returns_matrix(returns_path: str) -> pd.DataFrame:
     """
-    For a given period, load:
-      - returns_{start}_{end}.csv (daily returns matrix)
-      - responses/gpt_{start}_{end}.json (LLM expected returns)
-      - market caps snapshot from filtered_sp500_data.csv (month = end_date)
-    Then compute BL weights.
+    Load returns_{start}_{end}.csv robustly.
+    Supports:
+      - monthly matrix with column 'ym' + tickers
+      - matrix saved with an index column (Unnamed: 0)
+      - also accepts 'date_key' / 'Date'
+    Output index is month-start datetime (YYYY-MM-01).
     """
-    # --- Market caps (from filtered_sp500_data.csv) ---
+    df = pd.read_csv(returns_path, low_memory=False)
+
+    # If first col is unnamed index, drop it
+    if len(df.columns) > 0 and str(df.columns[0]).lower().startswith("unnamed"):
+        df = df.drop(columns=[df.columns[0]])
+
+    # Identify date column
+    if "ym" in df.columns:
+        dt = pd.to_datetime(df["ym"].astype(str) + "-01", errors="coerce")
+        df = df.drop(columns=["ym"])
+        df.index = dt.dt.to_period("M").dt.to_timestamp()
+    elif "date_key" in df.columns:
+        dt = pd.to_datetime(df["date_key"], errors="coerce")
+        df = df.drop(columns=["date_key"])
+        df.index = dt.dt.to_period("M").dt.to_timestamp()
+    elif "Date" in df.columns:
+        dt = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.drop(columns=["Date"])
+        df.index = dt.dt.to_period("M").dt.to_timestamp()
+    else:
+        raise ValueError(f"Returns file has no 'ym'/'date_key'/'Date' column: {returns_path}")
+
+    # Normalize tickers columns & numeric
+    df.columns = [_normalize_ticker(c) for c in df.columns]
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Drop all-NaN columns
+    df = df.dropna(axis=1, how="all")
+
+    # Drop duplicated months if any
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
+
+
+def load_llm_responses(responses_path: str) -> Dict[str, dict]:
+    """Load responses/{model}_{start}_{end}.json and normalize ticker keys."""
+    with open(responses_path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    out = {}
+    for k, v in d.items():
+        out[_normalize_ticker(k)] = v
+    return out
+
+
+# -------------------------
+# Black-Litterman core
+# -------------------------
+def black_litterman_LLM(
+    data_dict: Dict[str, dict],
+    returns_df: pd.DataFrame,
+    tickers: List[str],
+    market_equilibrium_return: np.ndarray,
+    tau: float,
+    risk_aversion: float = 0.1,
+) -> np.ndarray:
+    """
+    Black-Litterman with LLM views (Q) from data_dict[ticker]["expected_return"] list of samples.
+    """
+    Q = []
+    Omega_diag = []
+    keep = []
+
+    for t in tickers:
+        samples = data_dict.get(t, {}).get("expected_return", None)
+        if not isinstance(samples, list) or len(samples) == 0:
+            continue
+        samples = pd.to_numeric(pd.Series(samples), errors="coerce").dropna().to_numpy(dtype=float)
+        if samples.size == 0:
+            continue
+        q = float(np.mean(samples))
+        v = float(np.var(samples)) if samples.size > 1 else 1e-6
+        Q.append(q)
+        Omega_diag.append(max(v, 1e-8))
+        keep.append(t)
+
+    if len(keep) < 2:
+        return np.ones(len(tickers), dtype=float) / len(tickers)
+
+    returns_used = returns_df[keep].copy()
+
+    # Pairwise covariance; avoids brittle dropna(axis=1)
+    sigma = returns_used.cov(min_periods=2).to_numpy(dtype=float)
+    sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+
+    eq_map = dict(zip(tickers, market_equilibrium_return))
+    pi = np.array([eq_map.get(t, 0.0) for t in keep], dtype=float)
+
+    P = np.eye(len(keep), dtype=float)
+    Q = np.array(Q, dtype=float)
+    Omega = np.diag(Omega_diag).astype(float)
+
+    tau_sigma = tau * sigma
+    inv_tau_sigma = np.linalg.pinv(tau_sigma)
+    inv_Omega = np.linalg.pinv(Omega)
+    M = np.linalg.pinv(inv_tau_sigma + P.T @ inv_Omega @ P)
+
+    posterior_returns = M @ (inv_tau_sigma @ pi + P.T @ inv_Omega @ Q)
+
+    # Mean-variance optimisation (long-only, fully invested)
+    def portfolio_variance(w, cov_matrix):
+        return float(w.T @ cov_matrix @ w)
+
+    def objective_function(w, exp_rets, cov_matrix):
+        return portfolio_variance(w, cov_matrix) - float(risk_aversion) * float(w @ exp_rets)
+
+    constraints = (
+        {"type": "eq", "fun": lambda x: np.sum(x) - 1.0},
+        {"type": "ineq", "fun": lambda x: x},
+    )
+    bounds = tuple((0.0, 1.0) for _ in range(len(keep)))
+    x0 = np.ones(len(keep), dtype=float) / len(keep)
+
+    result = minimize(
+        objective_function,
+        x0,
+        args=(posterior_returns, sigma),
+        constraints=constraints,
+        bounds=bounds,
+        options={"maxiter": 2000},
+    )
+    w_keep = result.x if result.success else x0
+
+    # Expand to full tickers
+    w_full = np.zeros(len(tickers), dtype=float)
+    idx_map = {t: i for i, t in enumerate(tickers)}
+    for t, w in zip(keep, w_keep):
+        w_full[idx_map[t]] = float(w)
+
+    s = w_full.sum()
+    if s > 0:
+        w_full = w_full / s
+    return w_full
+
+
+# -------------------------
+# Equilibrium returns (robust beta calc)
+# -------------------------
+def compute_market_equilibrium_returns(
+    returns_df: pd.DataFrame,
+    market_caps: Dict[str, float],
+    risk_free_rate_annual: float = 0.02,
+    debug_tag: str = "",
+    returns_file: str = "",
+    debug_beta: bool = False,
+    debug_beta_max: int = 10,
+) -> Tuple[List[str], np.ndarray]:
+    """
+    CAPM-like equilibrium:
+      - cap-weighted market return from returns_df using market_caps
+      - betas vs market computed robustly (requires >=2 observations per ticker)
+      - pi = beta * market_risk_premium
+
+    Avoids RuntimeWarnings (ddof<=0, divide by zero).
+    Prints which returns file has insufficient data, and optional tickers.
+    """
+    caps_s = pd.Series({_normalize_ticker(k): v for k, v in market_caps.items()}, dtype=float).dropna()
+    common = [t for t in returns_df.columns if t in caps_s.index]
+    if len(common) < 2:
+        raise ValueError("Not enough tickers after intersecting returns with market caps.")
+
+    caps_s = caps_s.loc[common]
+    w_mkt = caps_s / caps_s.sum()
+
+    # cap-weighted market return
+    mkt = (returns_df[common].mul(w_mkt, axis=1)).sum(axis=1)
+
+    rf = risk_free_rate_annual / 12.0
+
+    mkt_valid = mkt.dropna()
+    if mkt_valid.shape[0] < 2:
+        msg = f"{debug_tag} Market series has <2 valid observations."
+        if returns_file:
+            msg += f" returns_file={returns_file}"
+        raise ValueError(msg)
+
+    mkt_var = float(mkt_valid.var(ddof=1))
+    if (not np.isfinite(mkt_var)) or mkt_var <= 1e-18:
+        msg = f"{debug_tag} Market variance is zero/NaN; cannot compute betas."
+        if returns_file:
+            msg += f" returns_file={returns_file}"
+        raise ValueError(msg)
+
+    betas = pd.Series(index=returns_df.columns, dtype=float)
+    insufficient_tickers: List[str] = []
+
+    for t in returns_df.columns:
+        x = returns_df[t]
+        xy = pd.concat([x, mkt], axis=1).dropna()
+        if xy.shape[0] < 2:
+            betas.loc[t] = 0.0
+            insufficient_tickers.append(t)
+            continue
+
+        cov_tm = float(xy.iloc[:, 0].cov(xy.iloc[:, 1], ddof=1))
+        if not np.isfinite(cov_tm):
+            betas.loc[t] = 0.0
+            insufficient_tickers.append(t)
+            continue
+
+        betas.loc[t] = cov_tm / mkt_var
+
+    if insufficient_tickers and returns_file:
+        print(
+            f"{debug_tag} beta: insufficient data for {len(insufficient_tickers)} tickers -> betas set to 0. "
+            f"returns_file={returns_file}"
+        )
+        if debug_beta:
+            show = insufficient_tickers[: max(1, int(debug_beta_max))]
+            print(f"{debug_tag} tickers (first {len(show)}): {show}")
+
+    mkt_rp = float((mkt_valid - rf).mean())
+    pi = (betas.fillna(0.0) * mkt_rp).to_numpy(dtype=float)
+    return list(returns_df.columns), pi
+
+
+# -------------------------
+# Period processing
+# -------------------------
+def process_period_for_model(
+    model_name: str,
+    start_date: str,
+    end_date: str,
+    tau: float,
+    returns_dir: str,
+    responses_dir: str,
+    filtered_csv_path: str,
+    risk_free_rate_annual: float = 0.02,
+    min_tickers: int = 25,
+    debug_beta: bool = False,
+    debug_beta_max: int = 10,
+) -> pd.Series:
+    """
+    For a given period and model:
+      - load returns file
+      - load LLM responses json
+      - load market caps snapshot from filtered_sp500_data.csv (month=end_date)
+      - compute equilibrium returns (robust)
+      - compute BL weights using LLM views
+    """
     market_caps = load_market_caps_from_filtered(filtered_csv_path, end_date)
 
-    # --- Returns data ---
-    returns = pd.read_csv(f"yfinance/returns_{start_date}_{end_date}.csv", index_col=0)
+    returns_path = Path(returns_dir) / f"returns_{start_date}_{end_date}.csv"
+    if not returns_path.exists():
+        raise FileNotFoundError(f"Missing returns file: {returns_path}")
 
-    # Restrict to tickers with market caps
-    returns = returns[returns.columns.intersection(market_caps.keys())]
+    returns_df = load_returns_matrix(str(returns_path))
+    if returns_df.shape[0] < 2:
+        raise ValueError(f"Returns matrix too short (rows={returns_df.shape[0]}): {returns_path}")
 
-    # Drop columns with any NaN
-    nan_cols = returns.columns[returns.isna().any()]
-    returns = returns.dropna(axis=1)
-
-    tickers = returns.columns.tolist()
-    if len(tickers) < 2:
-        raise ValueError("Not enough tickers after filtering/dropping NaNs to compute covariance.")
-
-    # Also restrict market_caps to remaining tickers
-    market_caps_series = pd.Series(market_caps, dtype=float)
-    market_caps_series = market_caps_series.loc[market_caps_series.index.intersection(tickers)].dropna()
-
-    if market_caps_series.empty:
-        raise ValueError("No valid market caps after intersecting with returns columns.")
-
-    market_cap_weights = market_caps_series / market_caps_series.sum()
-    valid_tickers = market_cap_weights.index.tolist()
-
-    # Market cap weighted market return
-    market_return_weighted = (returns[valid_tickers] * market_cap_weights).sum(axis=1)
-
-    # --- Market equilibrium returns (CAPM-like) ---
-    risk_free_rate = 0.02
-    market_var = market_return_weighted.var()
-    if market_var == 0 or np.isnan(market_var):
-        raise ValueError("Market variance is zero/NaN; cannot compute betas.")
-
-    market_beta = returns[valid_tickers].apply(lambda x: x.cov(market_return_weighted)) / market_var
-    market_risk_premium = (market_return_weighted - risk_free_rate).mean()
-    market_equilibrium_return = market_beta * market_risk_premium
-    market_equilibrium_return = market_equilibrium_return.reindex(tickers).fillna(0.0).to_numpy(dtype=float)
-
-    # --- Load LLM responses (GPT) ---
-    resp_path = Path(f"responses/gpt_{start_date}_{end_date}.json")
+    resp_path = Path(responses_dir) / f"{model_name}_{start_date}_{end_date}.json"
     if not resp_path.exists():
         raise FileNotFoundError(f"Missing LLM response file: {resp_path}")
 
-    with resp_path.open("r", encoding="utf-8") as f:
-        gpt_dict = json.load(f)
+    model_dict = load_llm_responses(str(resp_path))
+    good_resp = {t: v for t, v in model_dict.items() if isinstance(v, dict)}
 
-    # Remove nan columns and stocks not in returns data
-    gpt_dict = {k: v for k, v in gpt_dict.items() if k in tickers and k not in nan_cols}
+    # Restrict returns to tickers available in responses
+    common_cols = [c for c in returns_df.columns if c in good_resp]
+    if len(common_cols) < 2:
+        raise ValueError("Not enough overlapping tickers between returns and model responses.")
+    if len(common_cols) < int(min_tickers):
+        # permissive: keep going, but you'll see the debug prints if betas are unstable
+        pass
 
-    # Some response files might contain extra tickers not in returns
-    tickers_used = [t for t in tickers if t in gpt_dict]
-    if len(tickers_used) < 2:
-        raise ValueError("Not enough overlapping tickers between returns and GPT responses.")
+    returns_df = returns_df[common_cols].copy()
 
-    # Subset returns matrix to tickers_used (same order)
-    returns_used = returns[tickers_used].to_numpy(dtype=float)
+    tickers_all, pi = compute_market_equilibrium_returns(
+        returns_df=returns_df,
+        market_caps=market_caps,
+        risk_free_rate_annual=risk_free_rate_annual,
+        debug_tag=f"[{model_name}] {start_date}->{end_date}",
+        returns_file=str(returns_path),
+        debug_beta=debug_beta,
+        debug_beta_max=debug_beta_max,
+    )
 
-    # Subset equilibrium returns to tickers_used (same order)
-    # market_equilibrium_return was built aligned to `tickers` earlier
-    # Recompute for tickers_used
-    eq_map = dict(zip(tickers, market_equilibrium_return))
-    mkt_eq_used = np.array([eq_map.get(t, 0.0) for t in tickers_used], dtype=float)
+    w = black_litterman_LLM(
+        data_dict=good_resp,
+        returns_df=returns_df,
+        tickers=tickers_all,
+        market_equilibrium_return=pi,
+        tau=tau,
+        risk_aversion=0.1,
+    )
 
-    weights = black_litterman_LLM(gpt_dict, returns_used, tickers_used, mkt_eq_used, tau)
-    return pd.Series(weights, index=tickers_used)
+    return pd.Series(w, index=tickers_all)
 
 
+# -------------------------
+# Main (multi-model)
+# -------------------------
 def main():
-    tau = 0.025  # hyperparameter
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--models", nargs="+", default=["gpt"], help="e.g. --models gpt gemma3_1b")
+    parser.add_argument("--tau", type=float, default=0.025)
+    parser.add_argument("--start", type=str, default="2021-01-01")
+    parser.add_argument("--end", type=str, default="2021-06-30")
 
-    date_pairs = [
-        ("2021-01-01", "2021-01-31"),
-        ("2021-02-01", "2021-02-28"),
-        ("2021-03-01", "2021-03-31"),
-        ("2021-04-01", "2021-04-30"),
-        ("2021-05-01", "2021-05-31"),
-        ("2021-06-01", "2021-06-30"),
-        ("2021-07-01", "2021-07-31")
-    ]
+    parser.add_argument("--returns_dir", type=str, default="yfinance")
+    parser.add_argument("--responses_dir", type=str, default="responses")
+    parser.add_argument("--filtered_csv", type=str, default="yfinance/filtered_sp500_data.csv")
+    parser.add_argument("--results_dir", type=str, default="results")
 
-    gpt_results = {}
+    parser.add_argument("--risk_free_rate", type=float, default=0.02)
+    parser.add_argument("--min_tickers", type=int, default=25)
 
-    for start_date, end_date in tqdm(date_pairs):
-        print(f"Processing period: {start_date} to {end_date}")
-        try:
-            gpt_weights = process_period(start_date, end_date, tau, filtered_csv_path="yfinance/filtered_sp500_data.csv")
-            gpt_results[(start_date, end_date)] = gpt_weights
-        except Exception as e:
-            print(f"Error processing period {start_date} to {end_date}: {str(e)}")
+    parser.add_argument("--fail_fast", action="store_true", help="Stop on first error.")
 
-    gpt_results_df = pd.DataFrame(gpt_results).T
-    gpt_results_df = gpt_results_df.reset_index()
-    gpt_results_df["Date"] = gpt_results_df["level_0"]
-    gpt_results_df = gpt_results_df.drop(["level_0", "level_1"], axis=1)
+    # NEW: debug betas
+    parser.add_argument(
+        "--debug_beta",
+        action="store_true",
+        help="Print tickers with insufficient data when computing betas (also prints the returns file).",
+    )
+    parser.add_argument("--debug_beta_max", type=int, default=10, help="How many tickers to print when debug_beta is on.")
 
-    Path("results").mkdir(parents=True, exist_ok=True)
-    gpt_results_df.to_csv(f"results/gpt_black_litterman_weights_tau_{tau}.csv", index=False)
+    args = parser.parse_args()
 
-    print("\nResults shape:")
-    print(f"GPT results: {gpt_results_df.shape}")
+    Path(args.results_dir).mkdir(parents=True, exist_ok=True)
+    periods = month_pairs(args.start, args.end)
+
+    for model in args.models:
+        model = model.strip()
+        print(f"\n=== Evaluating model: {model} | tau={args.tau} | {args.start} -> {args.end} ===")
+
+        results = {}  # (start,end) -> Series weights
+        for start_date, end_date in tqdm(periods, desc=f"{model} periods"):
+            try:
+                w = process_period_for_model(
+                    model_name=model,
+                    start_date=start_date,
+                    end_date=end_date,
+                    tau=float(args.tau),
+                    returns_dir=args.returns_dir,
+                    responses_dir=args.responses_dir,
+                    filtered_csv_path=args.filtered_csv,
+                    risk_free_rate_annual=float(args.risk_free_rate),
+                    min_tickers=int(args.min_tickers),
+                    debug_beta=bool(args.debug_beta),
+                    debug_beta_max=int(args.debug_beta_max),
+                )
+                results[(start_date, end_date)] = w
+            except Exception as e:
+                msg = f"[{model}] Error period {start_date} -> {end_date}: {e}"
+                if args.fail_fast:
+                    raise
+                print(msg)
+
+        if not results:
+            print(f"[{model}] No results produced. (Check missing files / overlap / dates.)")
+            continue
+
+        # Build DataFrame: rows=periods, cols=tickers
+        df = pd.DataFrame(results).T
+
+        # Turn tuple index into columns cleanly
+        df = df.reset_index()
+        if "index" in df.columns:
+            df[["start_date", "end_date"]] = pd.DataFrame(df["index"].tolist(), index=df.index)
+            df = df.drop(columns=["index"])
+        else:
+            # in case pandas named them level_0/level_1
+            if "level_0" in df.columns and "level_1" in df.columns:
+                df = df.rename(columns={"level_0": "start_date", "level_1": "end_date"})
+            else:
+                raise ValueError("Unexpected index format after reset_index; cannot recover period dates.")
+
+        df["Date"] = df["start_date"]  # keep compatibility with downstream scripts
+        df = df.drop(columns=["start_date", "end_date"])
+
+        out_path = Path(args.results_dir) / f"{model}_black_litterman_weights_tau_{args.tau}.csv"
+        df.to_csv(out_path, index=False)
+        print(f"[{model}] Saved weights: {out_path} | shape={df.shape}")
 
 
 if __name__ == "__main__":

@@ -4,19 +4,16 @@
 """
 Baselines portfolios computed from ONE master file: yfinance/filtered_sp500_data.csv
 
-Fixes vs your current baselines.py:
-1) Windows are filtered using (year, month) from the master file (more robust than comparing dates).
-2) Mean-variance uses a LOOKBACK window (default 12 months) so covariance is computable with monthly data.
-3) Universe comes directly from master columns:
-   - tic (ticker)
-   - market_equity (keeps only tickers with a valid market cap in the TRAIN-END month)
-
-Outputs (same style as before):
-  responses_portfolios/equal_weighted_portfolio_<train_start>_<train_end>.csv
-  responses_portfolios/optimized_portfolio_<train_start>_<train_end>.csv
+Key changes vs prior version:
+- Uses MONTHLY panel: last observation per (tic, ym) from filtered_sp500_data.csv
+- Adds min_train_rows (default 12) and will expand history backward to reach it if possible
+- Does NOT reduce the universe by market cap (no top-N filtering)
+- Still outputs one CSV per training month:
+    responses_portfolios/equal_weighted_portfolio_<train_start>_<train_end>.csv
+    responses_portfolios/optimized_portfolio_<train_start>_<train_end>.csv
 """
 
-import calendar
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -25,24 +22,12 @@ from scipy.optimize import minimize
 
 
 # ----------------------------
-# Config
-# ----------------------------
-MASTER_PATH = Path("yfinance/filtered_sp500_data.csv")
-OUT_DIR = Path("responses_portfolios")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-TRAIN_YEAR = 2021
-TRAIN_MONTHS = range(1, 7)      # June..November => 6 windows
-LOOKBACK_MONTHS = 12             # <-- KEY FIX for monthly data
-LAMBDA_PARAM = 0.1               # same spirit as original
-LONG_ONLY = True                 # no short-selling
-
-
-# ----------------------------
 # Helpers
 # ----------------------------
-def get_last_day_of_month(year: int, month: int) -> int:
-    return calendar.monthrange(year, month)[1]
+def _normalize_ticker_series(s: pd.Series) -> pd.Series:
+    s = s.astype(str).str.strip().str.upper()
+    s = s.str.replace("-", ".", regex=False)
+    return s
 
 
 def parse_master(df: pd.DataFrame) -> pd.DataFrame:
@@ -58,30 +43,31 @@ def parse_master(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise KeyError(f"filtered_sp500_data.csv is missing required columns: {sorted(missing)}")
 
-    # Parse date (month-end trading date)
+    # Parse date (YYYYMMDD)
     if np.issubdtype(df["date"].dtype, np.number):
         df["Date"] = pd.to_datetime(df["date"].astype("Int64").astype(str), format="%Y%m%d", errors="coerce")
     else:
         df["Date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["Date"])
+    df = df.dropna(subset=["Date"]).copy()
 
     # Normalize ticker and returns
-    df["tic"] = df["tic"].astype(str).str.upper().str.strip()
+    df["tic"] = _normalize_ticker_series(df["tic"])
     df["stock_ret"] = pd.to_numeric(df["stock_ret"], errors="coerce")
 
     # year/month as ints
     df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
     df["month"] = pd.to_numeric(df["month"], errors="coerce").astype("Int64")
 
-    # Monthly period index (robust filtering)
     ym_dt = pd.to_datetime(
-        dict(year=df["year"].astype("Int64"),
-             month=df["month"].astype("Int64"),
-             day=1),
-        errors="coerce"
+        dict(
+            year=df["year"].astype("Int64"),
+            month=df["month"].astype("Int64"),
+            day=1,
+        ),
+        errors="coerce",
     )
     df["ym"] = ym_dt.dt.to_period("M")
-    df = df.dropna(subset=["ym"])
+    df = df.dropna(subset=["ym"]).copy()
 
     if "market_equity" in df.columns:
         df["market_equity"] = pd.to_numeric(df["market_equity"], errors="coerce")
@@ -89,15 +75,34 @@ def parse_master(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_returns_matrix(df_slice: pd.DataFrame) -> pd.DataFrame:
+def build_monthly_panel(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Pivot (Date, tic, stock_ret) into wide returns:
-      index  = Date (one row per month in your file)
-      cols   = tickers
+    Returns a monthly panel with ONE row per (tic, ym):
+      - keeps the last available Date in that month for each ticker
+      - keeps stock_ret for that snapshot
+
+    Output columns include: [ym (Period), ym_dt (Timestamp month-start), tic, stock_ret]
+    """
+    tmp = df.dropna(subset=["ym", "tic"]).copy()
+    tmp = tmp.sort_values(["tic", "ym", "Date"])
+    tmp = tmp.drop_duplicates(subset=["tic", "ym"], keep="last")  # last obs of the month
+
+    tmp["ym_dt"] = tmp["ym"].dt.to_timestamp()  # month-start Timestamp
+    tmp = tmp[["ym", "ym_dt", "tic", "stock_ret"]].copy()
+    return tmp
+
+
+def pivot_monthly_returns(monthly_panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pivot monthly panel to wide returns matrix:
+      index = ym_dt (month start)
+      columns = tickers
       values = stock_ret
     """
-    R = (df_slice.pivot_table(index="Date", columns="tic", values="stock_ret", aggfunc="mean")
-                  .sort_index())
+    R = (
+        monthly_panel.pivot_table(index="ym_dt", columns="tic", values="stock_ret", aggfunc="mean")
+        .sort_index()
+    )
     return R
 
 
@@ -137,125 +142,275 @@ def optimize_mean_variance(train_R: pd.DataFrame, lambda_param: float = 0.1, lon
     return w / s if s != 0 else np.full(n, 1.0 / n)
 
 
+def _month_starts_inclusive(start: str, end: str) -> pd.DatetimeIndex:
+    s = pd.to_datetime(start)
+    e = pd.to_datetime(end)
+    return pd.date_range(s, e, freq="MS")
+
+
+def _debug_opt_diagnostics(train_R: pd.DataFrame, debug_top: int = 15) -> None:
+    obs_per_asset = train_R.notna().sum(axis=0).sort_values()
+    na_ratio = float(train_R.isna().mean().mean()) if train_R.size > 0 else np.nan
+
+    print(f"[DEBUG_OPT] train_R shape={train_R.shape} | avg NaN ratio={na_ratio:.3%}")
+    if len(obs_per_asset) > 0:
+        print("[DEBUG_OPT] obs per asset (min/median/max):",
+              int(obs_per_asset.min()), float(obs_per_asset.median()), int(obs_per_asset.max()))
+        low = obs_per_asset[obs_per_asset < 3]
+        if len(low) > 0:
+            show = low.head(int(debug_top))
+            print(f"[DEBUG_OPT] assets with <3 obs (show {len(show)}/{len(low)}): {show.index.tolist()}")
+
+    Sigma = train_R.cov()
+    n_nan_cov = int(Sigma.isna().sum().sum())
+    print(f"[DEBUG_OPT] covariance NaN entries={n_nan_cov}")
+
+    S = np.nan_to_num(Sigma.to_numpy(dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        rank = int(np.linalg.matrix_rank(S))
+        cond = float(np.linalg.cond(S)) if S.shape[0] else np.nan
+        print(f"[DEBUG_OPT] covariance rank={rank}/{S.shape[0]} | cond={cond:.3e}")
+    except Exception as e:
+        print(f"[DEBUG_OPT] rank/cond failed: {e}")
+
+    if n_nan_cov > 0:
+        nan_by_col = Sigma.isna().sum(axis=0).sort_values(ascending=False)
+        print("[DEBUG_OPT] top covariance NaN columns:", nan_by_col.head(int(debug_top)).to_dict())
+
+
 # ----------------------------
 # Main
 # ----------------------------
 def main():
-    if not MASTER_PATH.exists():
-        raise FileNotFoundError(f"Cannot find {MASTER_PATH}. Make sure the path is correct.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--master_path", type=str, default="yfinance/filtered_sp500_data.csv")
+    ap.add_argument("--out_dir", type=str, default="responses_portfolios")
 
-    df = pd.read_csv(MASTER_PATH, low_memory=False)
+    ap.add_argument("--start", type=str, default="2021-01-01")
+    ap.add_argument("--end", type=str, default="2022-06-30")
+
+    ap.add_argument("--lookback_months", type=int, default=12)
+    ap.add_argument("--min_train_rows", type=int, default=12, help="Minimum months required to run MVO optimization.")
+    ap.add_argument("--lambda_param", type=float, default=0.1)
+    ap.add_argument("--long_only", action="store_true", help="Long-only optimization (default True).")
+    ap.add_argument("--allow_short", action="store_true", help="Allow shorting (overrides long_only).")
+
+    ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+
+    ap.add_argument("--debug_opt", action="store_true")
+    ap.add_argument("--debug_opt_top", type=int, default=15)
+
+    args = ap.parse_args()
+
+    master_path = Path(args.master_path)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not master_path.exists():
+        raise FileNotFoundError(f"Cannot find {master_path}.")
+
+    lookback = max(1, int(args.lookback_months))
+    min_train_rows = max(1, int(args.min_train_rows))
+
+    long_only = True
+    if args.allow_short:
+        long_only = False
+    elif args.long_only:
+        long_only = True
+
+    df = pd.read_csv(master_path, low_memory=False)
     df = parse_master(df)
 
-    for train_month in TRAIN_MONTHS:
-        train_year = TRAIN_YEAR
+    monthly_panel = build_monthly_panel(df)
 
-        # test month/year
-        if train_month == 12:
-            test_month, test_year = 1, train_year + 1
-        else:
-            test_month, test_year = train_month + 1, train_year
+    # Available month range in the file
+    min_ym = monthly_panel["ym"].min()
+    max_ym = monthly_panel["ym"].max()
+    if not args.quiet:
+        print(f"Data months available in CSV: {min_ym} -> {max_ym}")
 
-        train_start = pd.Timestamp(train_year, train_month, 1)
-        train_end = pd.Timestamp(train_year, train_month, get_last_day_of_month(train_year, train_month))
-        test_start = pd.Timestamp(test_year, test_month, 1)
-        test_end = pd.Timestamp(test_year, test_month, get_last_day_of_month(test_year, test_month))
+    start_dt = pd.to_datetime(args.start)
+    end_dt = pd.to_datetime(args.end)
 
-        print(f"\nProcessing: Training {train_start.date()} to {train_end.date()}, Testing {test_start.date()} to {test_end.date()}")
+    # Because test month is M+1, last training month must be <= end_dt - 1 month
+    last_train_month_start = (end_dt - pd.offsets.MonthBegin(1)).to_period("M").to_timestamp()
 
-        # Periods
-        train_end_p = pd.Period(f"{train_year}-{train_month:02d}", freq="M")
-        train_start_p = train_end_p - (LOOKBACK_MONTHS - 1)
+    month_starts = _month_starts_inclusive(args.start, args.end)
+    month_starts = month_starts[month_starts <= last_train_month_start]
+
+    if len(month_starts) == 0:
+        raise ValueError(
+            f"No training months generated. Because test is next month, training stops at {last_train_month_start.date()}."
+        )
+
+    for train_start_dt in month_starts:
+        train_end_dt = (train_start_dt + pd.offsets.MonthEnd(1))
+        train_end_p = train_start_dt.to_period("M")
         test_p = train_end_p + 1
 
-        # Train = lookback months up to train_end; Test = next month
-        train_df = df[(df["ym"] >= train_start_p) & (df["ym"] <= train_end_p)]
-        test_df = df[df["ym"] == test_p]
+        test_start_dt = test_p.to_timestamp()
+        test_end_dt = (test_start_dt + pd.offsets.MonthEnd(1))
 
-        # Force a single month-end Date for the test month (use the latest date present)
-        test_last_date = test_df["Date"].max()
-        test_df = test_df[test_df["Date"] == test_last_date]
+        out_eq = out_dir / f"equal_weighted_portfolio_{train_start_dt.date()}_{train_end_dt.date()}.csv"
+        out_opt = out_dir / f"optimized_portfolio_{train_start_dt.date()}_{train_end_dt.date()}.csv"
 
-        print("Train months expected:", train_start_p, "->", train_end_p)
-        print("Train months present :", sorted(train_df["ym"].unique()))
-        print("Nb rows train_df:", len(train_df))
-        print("Nb unique dates:", train_df["Date"].nunique())
-
-
-        if train_df.empty or test_df.empty:
-            print("No data for this window. Skipping.")
+        if (not args.overwrite) and out_eq.exists() and out_opt.exists():
+            if not args.quiet:
+                print(f"Skip (exists): {train_start_dt.date()} -> {train_end_dt.date()}")
             continue
 
-        # Universe: tickers with market_equity in TRAIN-END month AND present in TEST month
-        train_end_df = df[df["ym"] == train_end_p]
-        if "market_equity" in train_end_df.columns:
-            train_tickers = set(train_end_df.loc[train_end_df["market_equity"].notna(), "tic"].unique())
-        else:
-            train_tickers = set(train_end_df["tic"].unique())
+        # Base lookback window (we may expand backward to reach min_train_rows)
+        train_start_p = train_end_p - (lookback - 1)
 
-        test_tickers = set(test_df["tic"].unique())
-        universe = sorted(train_tickers.intersection(test_tickers))
+        # Expand backward if needed to reach min_train_rows months (if data exists)
+        cur_start_p = train_start_p
 
-        if not universe:
-            print("No overlapping tickers between train-end and test. Skipping.")
+        # Build test slice (single month)
+        test_slice = monthly_panel[monthly_panel["ym"] == test_p].copy()
+        if test_slice.empty:
+            if not args.quiet:
+                print(f"\nProcessing: {train_end_p} -> test {test_p} : No test data. Skipping.")
             continue
 
-        train_df = train_df[train_df["tic"].isin(universe)]
-        test_df = test_df[test_df["tic"].isin(universe)]
+        test_tickers = set(test_slice["tic"].unique())
 
-        # Build returns matrices
-        train_R = build_returns_matrix(train_df)
-        test_R = build_returns_matrix(test_df)
+        # Iteratively expand training window if too short
+        train_R = None
+        test_R = None
+        used_train_start_p = None
 
-        # Align columns
-        cols = train_R.columns.intersection(test_R.columns)
-        train_R = train_R[cols]
-        test_R = test_R[cols]
+        while True:
+            train_slice = monthly_panel[(monthly_panel["ym"] >= cur_start_p) & (monthly_panel["ym"] <= train_end_p)].copy()
 
-        # Drop assets with no data
-        train_R = train_R.dropna(axis=1, how="all")
-        test_R = test_R[train_R.columns]
+            # Universe: tickers present in TEST month, and present at least once in TRAIN slice
+            train_tickers = set(train_slice["tic"].unique())
+            universe = sorted(test_tickers.intersection(train_tickers))
 
-        # Covariance needs >=2 observations; also drop assets with <2 non-NA points
-        train_R = train_R.dropna(axis=1, thresh=2)
-        test_R = test_R[train_R.columns]
+            if len(universe) == 0:
+                train_R = None
+                used_train_start_p = cur_start_p
+                break
 
-        asset_columns = list(train_R.columns)
-        n_assets = len(asset_columns)
-        if n_assets == 0 or test_R.empty:
-            print("No usable assets after cleaning. Skipping.")
+            train_slice_u = train_slice[train_slice["tic"].isin(universe)].copy()
+            test_slice_u = test_slice[test_slice["tic"].isin(universe)].copy()
+
+            train_R_tmp = pivot_monthly_returns(train_slice_u)
+            test_R_tmp = pivot_monthly_returns(test_slice_u)
+
+            # Align columns
+            cols = train_R_tmp.columns.intersection(test_R_tmp.columns)
+            train_R_tmp = train_R_tmp[cols]
+            test_R_tmp = test_R_tmp[cols]
+
+            # Drop assets with no data
+            train_R_tmp = train_R_tmp.dropna(axis=1, how="all")
+            test_R_tmp = test_R_tmp[train_R_tmp.columns]
+
+            # Drop assets with <2 months of observations (needed for cov)
+            train_R_tmp = train_R_tmp.dropna(axis=1, thresh=2)
+            test_R_tmp = test_R_tmp[train_R_tmp.columns]
+
+            # Check rows in training (months)
+            if train_R_tmp.shape[0] >= min_train_rows:
+                train_R = train_R_tmp
+                test_R = test_R_tmp
+                used_train_start_p = cur_start_p
+                break
+
+            # If not enough rows, expand backward if possible
+            if cur_start_p <= min_ym:
+                train_R = train_R_tmp
+                test_R = test_R_tmp
+                used_train_start_p = cur_start_p
+                break
+
+            cur_start_p = cur_start_p - 1  # one more month back
+
+        if not args.quiet:
+            print(
+                f"\nProcessing: Training window {used_train_start_p} -> {train_end_p} "
+                f"(train_end={train_end_dt.date()}), Testing {test_start_dt.date()} -> {test_end_dt.date()}"
+            )
+
+        if train_R is None or train_R.empty or test_R is None or test_R.empty:
+            if not args.quiet:
+                print("No usable assets after cleaning. Skipping.")
             continue
 
-        # Equal-weight
+        n_assets = train_R.shape[1]
+
+        # Equal-weight (always)
         w_eq = np.full(n_assets, 1.0 / n_assets)
-        eq_returns = (test_R.fillna(0.0).to_numpy(dtype=float) @ w_eq)
+        eq_ret = float((test_R.fillna(0.0).to_numpy(dtype=float) @ w_eq).ravel()[0])
+        equal_weighted_portfolio = pd.DataFrame({"Date": [test_R.index[0]], "Portfolio_Return": [eq_ret]})
+        equal_weighted_portfolio.to_csv(out_eq, index=False)
 
-        equal_weighted_portfolio = pd.DataFrame({"Date": test_R.index, "Portfolio_Return": eq_returns})
-        equal_weighted_portfolio.to_csv(
-            OUT_DIR / f"equal_weighted_portfolio_{train_start.date()}_{train_end.date()}.csv",
-            index=False
-        )
-
-        # Optimized
-        if train_R.shape[0] < 2:
-            print("Not enough training observations for covariance. Using equal weights for optimized portfolio.")
+        # Optimized: only if we have enough train rows
+        if train_R.shape[0] < min_train_rows:
+            if not args.quiet:
+                print(
+                    f"Not enough training months for MVO (have {train_R.shape[0]}, need {min_train_rows}). "
+                    "Using equal weights for optimized portfolio."
+                )
             w_opt = w_eq
+
         else:
-            try:
-                w_opt = optimize_mean_variance(train_R, lambda_param=LAMBDA_PARAM, long_only=LONG_ONLY)
-            except Exception as e:
-                print(f"Optimization failed ({e}). Falling back to equal weights.")
+            # === NEW: completeness filter for MVO (not a market-cap filter) ===
+            obs = train_R.notna().sum(axis=0)
+
+            keep_cols = obs[obs >= min_train_rows].index
+            dropped = obs[obs < min_train_rows].sort_values()
+
+            if not args.quiet:
+                print(f"[MVO] Keeping {len(keep_cols)}/{train_R.shape[1]} assets with >= {min_train_rows} train months.")
+                if len(dropped) > 0:
+                    show = dropped.head(int(args.debug_opt_top))
+                    print(f"[MVO] Dropping (worst {len(show)}/{len(dropped)}): {show.to_dict()}")
+
+            train_R_mvo = train_R[keep_cols].copy()
+            test_R_mvo = test_R[keep_cols].copy()
+
+            if train_R_mvo.shape[1] < 2:
+                print("[MVO] Not enough assets after completeness filter. Falling back to equal weights.")
                 w_opt = w_eq
+            else:
+                try:
+                    w_opt_mvo = optimize_mean_variance(
+                        train_R_mvo,
+                        lambda_param=float(args.lambda_param),
+                        long_only=long_only
+                    )
 
-        opt_returns = (test_R.fillna(0.0).to_numpy(dtype=float) @ w_opt)
-        optimized_portfolio = pd.DataFrame({"Date": test_R.index, "Portfolio_Return": opt_returns})
-        optimized_portfolio.to_csv(
-            OUT_DIR / f"optimized_portfolio_{train_start.date()}_{train_end.date()}.csv",
-            index=False
-        )
+                    # Map back to full universe: dropped assets get 0 weight
+                    w_opt = np.zeros(train_R.shape[1], dtype=float)
+                    col_to_pos = {c: i for i, c in enumerate(train_R.columns)}
+                    for c, w in zip(train_R_mvo.columns, w_opt_mvo):
+                        w_opt[col_to_pos[c]] = float(w)
 
-        print(f"Saved portfolio results for training period: {train_start.date()} to {train_end.date()} | "
-              f"Assets: {n_assets} | Train obs: {train_R.shape[0]}")
+                    # Renormalize to sum to 1 (if needed)
+                    s = float(w_opt.sum())
+                    if s > 0:
+                        w_opt = w_opt / s
+                    else:
+                        w_opt = w_eq
+
+                except Exception as e:
+                    print(f"Optimization failed ({e}). Falling back to equal weights.")
+                    if args.debug_opt:
+                        _debug_opt_diagnostics(train_R_mvo, debug_top=int(args.debug_opt_top))
+                    w_opt = w_eq
+
+        opt_ret = float((test_R.fillna(0.0).to_numpy(dtype=float) @ w_opt).ravel()[0])
+        optimized_portfolio = pd.DataFrame({"Date": [test_R.index[0]], "Portfolio_Return": [opt_ret]})
+        optimized_portfolio.to_csv(out_opt, index=False)
+
+        if not args.quiet:
+            print(
+                f"Saved: {out_eq.name} & {out_opt.name} | "
+                f"Assets: {n_assets} | Train months: {train_R.shape[0]} | Test month: {test_p}"
+            )
+
 
 if __name__ == "__main__":
     main()
