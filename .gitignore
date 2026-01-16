@@ -2,3 +2,6 @@ keys.py
 __pycache__/keys.cpython-313.pyc
 __pycache__/keys.cpython-311.pyc
 filtered_sp500_data.csv
+yfinance
+results
+responses_portfolios
