@@ -1,31 +1,44 @@
-# run.py
-from __future__ import annotations
+"""run.py
+
+Run monthly inference of expected returns using an LLM.
+
+Supported model_name values:
+  - gpt   -> OpenAI via gpt_query.py (requires keys.py with gpt_key)
+  - gemma3 -> Ollama via gemma_query.py
+  - qwen  -> Ollama via qwen_query.py (internally uses qwen2.5:1.5b)
+
+To add future local models later, extend the _LOCAL_MODEL_MAP dict.
+"""
 
 import argparse
-import calendar
 import json
 import os
-import re
-from typing import Any
+from pathlib import Path
+import calendar
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# ------------------------------------------------------------
-# LLM selection (simple): you ONLY choose --model
-# ------------------------------------------------------------
-# Rules:
-#   - If model starts with 'gpt' (or o1/o3/o4), we call OpenAI via gpt_query.py
-#   - If model is 'gemma3' (or other local model ids), we call Ollama via gemma_query.py
-#
-# To add more models later: extend _infer_backend_from_model().
+# NOTE: Backend-specific imports are intentionally lazy (inside main),
+# so users can run Ollama models without having OpenAI installed/configured.
+
+
+# -------------------------
+# Model routing
+# -------------------------
+
+# Local model aliases -> actual Ollama model ids.
+# Keep the alias short because it also becomes the output prefix.
+_LOCAL_MODEL_MAP = {
+    "gemma3": "gemma3",
+    "qwen": "qwen2.5:1.5b",
+}
 
 
 # -------------------------
 # Utils
 # -------------------------
-
 def json_default(o):
     if isinstance(o, (np.integer,)):
         return int(o)
@@ -44,7 +57,9 @@ def normalize_ticker_series(s: pd.Series) -> pd.Series:
 
 
 def parse_yyyymmdd_int_to_datetime(s: pd.Series) -> pd.Series:
-    """Robust parse for YYYYMMDD stored as int/float/str."""
+    """
+    Robust parse for YYYYMMDD stored as int/float/str.
+    """
     ss = s.astype("Int64").astype(str).str.replace(r"\D+", "", regex=True).str.slice(0, 8)
     return pd.to_datetime(ss, format="%Y%m%d", errors="coerce")
 
@@ -53,96 +68,9 @@ def get_last_day_of_month(year: int, month: int) -> int:
     return calendar.monthrange(year, month)[1]
 
 
-def _safe_tag(x: str, max_len: int = 64) -> str:
-    """Filename-safe tag."""
-    x = str(x)
-    x = re.sub(r"[^A-Za-z0-9]+", "_", x).strip("_")
-    return (x[:max_len] or "model")
-
-
-# -------------------------
-# LLM factory
-# -------------------------
-
-def _infer_backend_from_model(model: str) -> str:
-    """Infer backend based on model id.
-
-    Minimal rule requested:
-      - GPT-* -> OpenAI
-      - gemma3 -> Ollama
-
-    Extend this mapping when you add more local models.
-    """
-    m = str(model).strip().lower()
-
-    # OpenAI-ish names
-    if m.startswith(("gpt", "o1", "o3", "o4", "chatgpt")):
-        return "openai"
-
-    # Explicit local-ish names (keep gemma3 as the key example)
-    if m.startswith(("gemma", "llama", "mistral", "mixtral", "qwen", "phi", "granite")):
-        return "ollama"
-
-    # If unsure: default to Ollama (local ids are arbitrary strings; OpenAI ids are usually gpt*/o*)
-    return "ollama"
-
-
-def _build_llm_client(model: str, backend: str, ollama_host: str):
-    """Instantiate the right LLM client (lazy imports)."""
-    backend = str(backend).lower().strip()
-
-    if backend == "openai":
-        try:
-            from keys import gpt_key  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Impossible d'importer keys.gpt_key. "
-                "Assure-toi d'avoir un fichier keys.py avec gpt_key='...'."
-            ) from e
-
-        try:
-            # Prefer package path if it exists, fallback to local file.
-            try:
-                from models_query.gpt_query import GPTQuery  # type: ignore
-            except Exception:
-                from gpt_query import GPTQuery  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Impossible d'importer GPTQuery. Installe OpenAI: pip install openai"
-            ) from e
-
-        return GPTQuery(
-            api_key=gpt_key,
-            model=model,
-            max_retries=5,
-            retry_backoff_s=1.0,
-        )
-
-    if backend == "ollama":
-        try:
-            try:
-                from models_query.gemma_query import GemmaQuery  # type: ignore
-            except Exception:
-                from gemma_query import GemmaQuery  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "Impossible d'importer GemmaQuery. Fais: pip install ollama"
-            ) from e
-
-        return GemmaQuery(
-            model=model,
-            host=ollama_host,
-            max_retries=5,
-            retry_backoff_s=1.0,
-        )
-
-    raise ValueError(f"Unknown backend: {backend!r}")
-
-
 # -------------------------
 # Prompts
 # -------------------------
-
 def make_system_prompt() -> str:
     return (
         "You are a model designed to predict stock returns. "
@@ -175,19 +103,17 @@ def make_user_prompt(ticker: str, row: dict) -> str:
 # -------------------------
 # Returns CSV builder (from filtered_sp500_data.csv)
 # -------------------------
-
 def build_returns_matrix_monthly(
     sp500_table: pd.DataFrame,
     window_start: pd.Timestamp,
     window_end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Build a MONTHLY returns matrix (1 row per month).
-
-    - index = ym (YYYY-MM as string)
-    - columns = tickers
-    - values = stock_ret (monthly returns)
-
-    We keep the last available date within each (ticker, month).
+    """
+    Build a MONTHLY returns matrix (1 row per month):
+      - index = ym (YYYY-MM as string)
+      - columns = tickers
+      - values = stock_ret (monthly returns)
+    Keep the last available date within each (ticker, month).
     """
     df = sp500_table.loc[
         (sp500_table["date_key"] >= window_start) & (sp500_table["date_key"] <= window_end),
@@ -197,13 +123,15 @@ def build_returns_matrix_monthly(
     df = df.dropna(subset=["date_key", "tic"])
     df["stock_ret"] = pd.to_numeric(df["stock_ret"], errors="coerce")
 
+    # month key
     df["ym"] = df["date_key"].dt.to_period("M")
 
+    # keep last obs within month per ticker
     df = df.sort_values(["tic", "date_key"]).drop_duplicates(subset=["tic", "ym"], keep="last")
 
     mat = df.pivot(index="ym", columns="tic", values="stock_ret").sort_index()
-    mat.index = mat.index.astype(str)
-    mat = mat.reset_index().rename(columns={"ym": "ym"})
+    mat.index = mat.index.astype(str)  # "YYYY-MM"
+    mat = mat.reset_index().rename(columns={"ym": "ym"})  # make 'ym' a column
     return mat
 
 
@@ -218,8 +146,8 @@ def ensure_returns_csv_for_period(
     lookback_months: int,
     overwrite: bool = False,
 ) -> str:
-    """Create the file expected by evaluate_multiple_updated.py:
-
+    """
+    Create the file expected by evaluate_multiple_updated.py:
         yfinance/returns_<period_start>_<period_end>.csv
 
     window_mode:
@@ -256,11 +184,13 @@ def ensure_returns_csv_for_period(
     else:
         raise ValueError(f"Unknown window_mode: {window_mode}")
 
+    # clamp to available data
     w_start = max(w_start, data_min)
     w_end = min(w_end, data_max)
 
     mat = build_returns_matrix_monthly(sp500_table, w_start, w_end)
 
+    # fallback: if too short window, use full range inside [global_start, global_end]
     if mat.shape[0] < 2:
         w_start2, w_end2 = max(g_start, data_min), min(g_end, data_max)
         mat = build_returns_matrix_monthly(sp500_table, w_start2, w_end2)
@@ -272,27 +202,25 @@ def ensure_returns_csv_for_period(
 # -------------------------
 # Main
 # -------------------------
-
 def main() -> None:
     parser = argparse.ArgumentParser()
-
-    # Only thing you choose for LLM is the model id.
+    # Model selector (also used as output filename prefix).
     # Examples:
-    #   --model gpt-4o-mini   -> OpenAI
-    #   --model gemma3        -> Ollama
-    parser.add_argument("--model", type=str, default="gpt-4o-mini")
+    #   --model_name gpt    (OpenAI; uses --openai_model)
+    #   --model_name gemma3 (Ollama; uses local Gemma3)
+    #   --model_name qwen   (Ollama; uses qwen2.5:1.5b)
+    parser.add_argument("--model_name", type=str, default="gpt")
 
-    # Optional (only used if --model resolves to ollama)
+    # OpenAI model id (only used when --model_name=gpt)
+    parser.add_argument("--openai_model", type=str, default="gpt-4o-mini")
+
+    # Ollama host (only used for local models like gemma3/qwen)
     parser.add_argument(
         "--ollama_host",
         type=str,
         default=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
         help="Ollama host URL (default: http://localhost:11434)",
     )
-
-    # Output filename prefix (defaults to a sanitized version of --model)
-    parser.add_argument("--output_prefix", type=str, default=None)
-
     parser.add_argument("--input_csv", type=str, default="yfinance/filtered_sp500_data.csv")
 
     parser.add_argument("--start", type=str, default="2021-01-01")
@@ -303,11 +231,7 @@ def main() -> None:
     parser.add_argument("--summary_json_max_chars", type=int, default=0)
     parser.add_argument("--lookback_months", type=int, default=12)
 
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Recompute months even if output json exists.",
-    )
+    parser.add_argument("--overwrite", action="store_true", help="Recompute months even if output json exists.")
 
     # returns csv generation
     parser.add_argument("--returns_out_dir", type=str, default="yfinance")
@@ -321,14 +245,87 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    model = str(args.model)
-    backend = _infer_backend_from_model(model)
+    model_name = str(args.model_name).strip().lower()
 
-    out_prefix = args.output_prefix or _safe_tag(model)
+    # Output prefix = model_name (keeps file names stable and short)
+    out_prefix = model_name
 
     os.makedirs("responses", exist_ok=True)
 
-    llm = _build_llm_client(model=model, backend=backend, ollama_host=args.ollama_host)
+    # -------------------------
+    # Build LLM client (lazy imports)
+    # -------------------------
+    if model_name == "gpt":
+        try:
+            from keys import gpt_key  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "Impossible d'importer keys.gpt_key. "
+                "Assure-toi d'avoir un fichier keys.py avec gpt_key='...'."
+            ) from e
+
+        try:
+            try:
+                from models_query.gpt_query import GPTQuery  # type: ignore
+            except Exception:
+                from gpt_query import GPTQuery  # type: ignore
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer GPTQuery. Fais: pip install openai") from e
+
+        llm = GPTQuery(
+            api_key=gpt_key,
+            model=str(args.openai_model),
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+        llm_backend = "openai"
+        llm_model_id = str(args.openai_model)
+
+    elif model_name in _LOCAL_MODEL_MAP:
+        # Local Ollama model
+        ollama_model_id = _LOCAL_MODEL_MAP[model_name]
+
+        if model_name == "qwen":
+            try:
+                try:
+                    from models_query.qwen_query import QwenQuery  # type: ignore
+                except Exception:
+                    from qwen_query import QwenQuery  # type: ignore
+            except Exception as e:
+                raise RuntimeError("Impossible d'importer QwenQuery. Fais: pip install ollama") from e
+
+            llm = QwenQuery(
+                model=ollama_model_id,
+                host=str(args.ollama_host),
+                max_retries=5,
+                retry_backoff_s=1.0,
+            )
+        else:
+            # Default local wrapper (GemmaQuery)
+            try:
+                try:
+                    from models_query.gemma_query import GemmaQuery  # type: ignore
+                except Exception:
+                    from gemma_query import GemmaQuery  # type: ignore
+            except Exception as e:
+                raise RuntimeError("Impossible d'importer GemmaQuery. Fais: pip install ollama") from e
+
+            llm = GemmaQuery(
+                model=ollama_model_id,
+                host=str(args.ollama_host),
+                max_retries=5,
+                retry_backoff_s=1.0,
+            )
+
+        llm_backend = "ollama"
+        llm_model_id = ollama_model_id
+
+    else:
+        raise ValueError(
+            f"Unknown --model_name={args.model_name!r}. "
+            f"Supported: 'gpt' + {sorted(_LOCAL_MODEL_MAP.keys())}"
+        )
 
     # Load data
     sp500_table = pd.read_csv(args.input_csv, low_memory=False)
@@ -387,7 +384,7 @@ def main() -> None:
             global_start=args.start,
             global_end=args.end,
             lookback_months=args.returns_lookback_months,
-            overwrite=args.overwrite,
+            overwrite=args.overwrite,  # if overwriting, also overwrite returns file
         )
 
         if already and (not args.overwrite):
@@ -444,8 +441,11 @@ def main() -> None:
             data_dict[tic] = row
 
         # Query LLM per ticker
-        desc = f"{backend}:{model} {month_start}->{month_end}"
-        for ticker in tqdm(list(data_dict.keys()), desc=desc, leave=False):
+        for ticker in tqdm(
+            list(data_dict.keys()),
+            desc=f"{llm_backend}:{llm_model_id} {month_start}->{month_end}",
+            leave=False,
+        ):
             user_prompt = make_user_prompt(ticker, data_dict[ticker])
 
             res = llm.sample_expected_return(
@@ -458,7 +458,7 @@ def main() -> None:
             data_dict[ticker]["expected_return"] = res.samples
             data_dict[ticker]["n_success"] = int(res.n_success)
             data_dict[ticker]["expected_return_mean"] = res.mean
-            # Optional debug
+            # If you want debug later:
             # data_dict[ticker]["errors"] = res.errors
 
         # Save month results

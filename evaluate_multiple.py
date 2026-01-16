@@ -383,10 +383,10 @@ def process_period_for_model(
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models", nargs="+", default=["gpt"], help="e.g. --models gpt gemma3_1b")
+    parser.add_argument("--models", nargs="+", default=["gpt gemma3_1b qwen"], help="e.g. --models gpt gemma3_1b qwen")
     parser.add_argument("--tau", type=float, default=0.025)
     parser.add_argument("--start", type=str, default="2021-01-01")
-    parser.add_argument("--end", type=str, default="2021-06-30")
+    parser.add_argument("--end", type=str, default="2023-06-30")
 
     parser.add_argument("--returns_dir", type=str, default="yfinance")
     parser.add_argument("--responses_dir", type=str, default="responses")

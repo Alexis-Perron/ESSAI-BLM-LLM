@@ -377,7 +377,7 @@ def main() -> None:
                         help=r"Path template with {year}, e.g. C:\...\{year}\text_us_{year}.pkl")
     parser.add_argument("--output_root", type=str, required=True, default="\TEXT DATA US SUMMARIZED",
                         help="Output root directory. Will create one folder per year.")
-    parser.add_argument("--start_year", type=int, default=2005)
+    parser.add_argument("--start_year", type=int, default=2021)
     parser.add_argument("--end_year", type=int, default=2025)
 
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
