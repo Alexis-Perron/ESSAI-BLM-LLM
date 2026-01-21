@@ -1,1 +1,3 @@
-- Ajouter niveau de confiance des prédictions LLMS (std des prédictions)
+- Ajouter niveau de confiance des prédictions LLMS (std des prédictions) (présentement, on utilise slm la moyenne des différentes réponses)
+- Ajouter utilisation de série temporelle de taux sans risque US, au lieu d'une constante
+- Ajouter d'autres modèles LLM

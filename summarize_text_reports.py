@@ -1,5 +1,7 @@
 """
-summarize_text_reports.py (v3)
+This python script: has largely been written by ChatGPT-5.2
+
+summarize_text_reports.py
 
 Creates summarized versions of the annual "text_us_{year}.pkl" files using OpenAI,
 keeping the original DataFrame structure and replacing large text with compact summaries.
@@ -30,7 +32,7 @@ Restartability:
 - Global JSON cache by text hash to avoid re-paying if you rerun
 
 Usage (Windows example):
-python summarize_text_reports_v3.py ^
+python summarize_text_reports.py ^
   --input_template "C:\\...\\TEXT DATA US by YEAR\\{year}\\text_us_{year}.pkl" ^
   --output_root "C:\\...\\TEXT DATA US SUMMARIZED" ^
   --start_year 2005 --end_year 2025 ^

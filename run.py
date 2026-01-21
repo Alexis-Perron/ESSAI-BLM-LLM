@@ -3,11 +3,10 @@
 Run monthly inference of expected returns using an LLM.
 
 Supported model_name values:
-  - gpt   -> OpenAI via gpt_query.py (requires keys.py with gpt_key)
+  - gpt   -> OpenAI via gpt_query.py
   - gemma3 -> Ollama via gemma_query.py
-  - qwen  -> Ollama via qwen_query.py (internally uses qwen2.5:1.5b)
+  - qwen  -> Ollama via qwen_query.py
 
-To add future local models later, extend the _LOCAL_MODEL_MAP dict.
 """
 
 import argparse
@@ -20,21 +19,15 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# NOTE: Backend-specific imports are intentionally lazy (inside main),
-# so users can run Ollama models without having OpenAI installed/configured.
-
-
 # -------------------------
 # Model routing
 # -------------------------
 
-# Local model aliases -> actual Ollama model ids.
-# Keep the alias short because it also becomes the output prefix.
-_LOCAL_MODEL_MAP = {
+MODEL_MAP = {
     "gemma3": "gemma3",
     "qwen": "qwen2.5:1.5b",
+    "gpt": "gpt-4o-mini"
 }
-
 
 # -------------------------
 # Utils
@@ -58,6 +51,7 @@ def normalize_ticker_series(s: pd.Series) -> pd.Series:
 
 def parse_yyyymmdd_int_to_datetime(s: pd.Series) -> pd.Series:
     """
+    This function was written by ChatGPT 5.2
     Robust parse for YYYYMMDD stored as int/float/str.
     """
     ss = s.astype("Int64").astype(str).str.replace(r"\D+", "", regex=True).str.slice(0, 8)
@@ -139,8 +133,6 @@ def ensure_returns_csv_for_period(
     sp500_table: pd.DataFrame,
     period_start: str,
     period_end: str,
-    out_dir: str,
-    window_mode: str,
     global_start: str,
     global_end: str,
     lookback_months: int,
@@ -149,21 +141,12 @@ def ensure_returns_csv_for_period(
     """
     Create the file expected by evaluate_multiple_updated.py:
         yfinance/returns_<period_start>_<period_end>.csv
-
-    window_mode:
-      - "full": use [global_start, global_end] for ALL periods (recommended for stable cov)
-      - "expanding": use [global_start, period_end]
-      - "rolling": use last `lookback_months` months ending at period_end
-      - "period": only [period_start, period_end] (not recommended for cov; too few rows)
     """
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"returns_{period_start}_{period_end}.csv")
+    os.makedirs('yfinance', exist_ok=True)
+    out_path = os.path.join('yfinance', f"returns_{period_start}_{period_end}.csv")
 
     if (not overwrite) and os.path.exists(out_path):
         return out_path
-
-    p_start = pd.to_datetime(period_start)
-    p_end = pd.to_datetime(period_end)
 
     data_min = sp500_table["date_key"].min()
     data_max = sp500_table["date_key"].max()
@@ -171,18 +154,7 @@ def ensure_returns_csv_for_period(
     g_start = pd.to_datetime(global_start)
     g_end = pd.to_datetime(global_end)
 
-    if window_mode == "full":
-        w_start, w_end = g_start, g_end
-    elif window_mode == "expanding":
-        w_start, w_end = g_start, p_end
-    elif window_mode == "rolling":
-        w_end = p_end
-        lb = max(1, int(lookback_months))
-        w_start = (p_end.to_period("M") - (lb - 1)).to_timestamp()
-    elif window_mode == "period":
-        w_start, w_end = p_start, p_end
-    else:
-        raise ValueError(f"Unknown window_mode: {window_mode}")
+    w_start, w_end = g_start, g_end
 
     # clamp to available data
     w_start = max(w_start, data_min)
@@ -211,15 +183,11 @@ def main() -> None:
     #   --model_name qwen   (Ollama; uses qwen2.5:1.5b)
     parser.add_argument("--model_name", type=str, default="gpt")
 
-    # OpenAI model id (only used when --model_name=gpt)
-    parser.add_argument("--openai_model", type=str, default="gpt-4o-mini")
-
     # Ollama host (only used for local models like gemma3/qwen)
     parser.add_argument(
         "--ollama_host",
         type=str,
-        default=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-        help="Ollama host URL (default: http://localhost:11434)",
+        default=os.getenv("OLLAMA_HOST", "http://localhost:11434")
     )
     parser.add_argument("--input_csv", type=str, default="yfinance/filtered_sp500_data.csv")
 
@@ -228,19 +196,11 @@ def main() -> None:
 
     parser.add_argument("--n_samples", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.5)
-    parser.add_argument("--summary_json_max_chars", type=int, default=0)
     parser.add_argument("--lookback_months", type=int, default=12)
 
     parser.add_argument("--overwrite", action="store_true", help="Recompute months even if output json exists.")
 
     # returns csv generation
-    parser.add_argument("--returns_out_dir", type=str, default="yfinance")
-    parser.add_argument(
-        "--returns_window_mode",
-        type=str,
-        default="full",
-        choices=["full", "expanding", "rolling", "period"],
-    )
     parser.add_argument("--returns_lookback_months", type=int, default=24)
 
     args = parser.parse_args()
@@ -249,6 +209,8 @@ def main() -> None:
 
     # Output prefix = model_name (keeps file names stable and short)
     out_prefix = model_name
+
+    model_id = MODEL_MAP[model_name]
 
     os.makedirs("responses", exist_ok=True)
 
@@ -260,8 +222,7 @@ def main() -> None:
             from keys import gpt_key  # type: ignore
         except Exception as e:
             raise RuntimeError(
-                "Impossible d'importer keys.gpt_key. "
-                "Assure-toi d'avoir un fichier keys.py avec gpt_key='...'."
+                "Can't import gpt_key from keys.py."
             ) from e
 
         try:
@@ -274,58 +235,45 @@ def main() -> None:
 
         llm = GPTQuery(
             api_key=gpt_key,
-            model=str(args.openai_model),
+            model=model_id,
             max_retries=5,
             retry_backoff_s=1.0,
         )
 
-        llm_backend = "openai"
-        llm_model_id = str(args.openai_model)
-
-    elif model_name in _LOCAL_MODEL_MAP:
-        # Local Ollama model
-        ollama_model_id = _LOCAL_MODEL_MAP[model_name]
-
-        if model_name == "qwen":
+    elif model_name == "qwen":
+        try:
             try:
-                try:
-                    from models_query.qwen_query import QwenQuery  # type: ignore
-                except Exception:
-                    from qwen_query import QwenQuery  # type: ignore
-            except Exception as e:
-                raise RuntimeError("Impossible d'importer QwenQuery. Fais: pip install ollama") from e
+                from models_query.qwen_query import QwenQuery  # type: ignore
+            except Exception:
+                from qwen_query import QwenQuery  # type: ignore
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer QwenQuery.") from e
 
-            llm = QwenQuery(
-                model=ollama_model_id,
-                host=str(args.ollama_host),
-                max_retries=5,
-                retry_backoff_s=1.0,
-            )
-        else:
-            # Default local wrapper (GemmaQuery)
+        llm = QwenQuery(
+            model=model_id,
+            host=str(args.ollama_host),
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+    elif model_name == "gemma3":
+        try:
             try:
-                try:
-                    from models_query.gemma_query import GemmaQuery  # type: ignore
-                except Exception:
-                    from gemma_query import GemmaQuery  # type: ignore
-            except Exception as e:
-                raise RuntimeError("Impossible d'importer GemmaQuery. Fais: pip install ollama") from e
+                from models_query.gemma_query import GemmaQuery  # type: ignore
+            except Exception:
+                from gemma_query import GemmaQuery  # type: ignore
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer GemmaQuery.") from e
 
-            llm = GemmaQuery(
-                model=ollama_model_id,
-                host=str(args.ollama_host),
-                max_retries=5,
-                retry_backoff_s=1.0,
-            )
-
-        llm_backend = "ollama"
-        llm_model_id = ollama_model_id
+        llm = GemmaQuery(
+            model=model_id,
+            host=str(args.ollama_host),
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
 
     else:
-        raise ValueError(
-            f"Unknown --model_name={args.model_name!r}. "
-            f"Supported: 'gpt' + {sorted(_LOCAL_MODEL_MAP.keys())}"
-        )
+        raise ValueError(f"Unknown model_name: {model_name}")
 
     # Load data
     sp500_table = pd.read_csv(args.input_csv, low_memory=False)
@@ -379,7 +327,6 @@ def main() -> None:
             sp500_table=sp500_table,
             period_start=month_start,
             period_end=month_end,
-            out_dir=args.returns_out_dir,
             window_mode=args.returns_window_mode,
             global_start=args.start,
             global_end=args.end,
@@ -390,7 +337,7 @@ def main() -> None:
         if already and (not args.overwrite):
             continue
 
-        # Current month snapshot (metadata)
+        # Current month snapshot
         current_p = month_start_dt.to_period("M")
         mdf = sp500_table.loc[sp500_table["ym"] == current_p].copy()
 
@@ -422,11 +369,6 @@ def main() -> None:
             else:
                 summary_json_val = str(summary_json_val)
 
-            maxc = int(args.summary_json_max_chars or 0)
-            if maxc > 0 and len(summary_json_val) > maxc:
-                half = maxc // 2
-                summary_json_val = summary_json_val[:half] + "\n...\n" + summary_json_val[-half:]
-
             row = {
                 "company_name": g[company_col].iloc[0] if company_col else "",
                 "gics_sector_name": g[sector_name_col].iloc[0] if sector_name_col else "",
@@ -443,7 +385,7 @@ def main() -> None:
         # Query LLM per ticker
         for ticker in tqdm(
             list(data_dict.keys()),
-            desc=f"{llm_backend}:{llm_model_id} {month_start}->{month_end}",
+            desc=f"{model_id} {month_start}->{month_end}",
             leave=False,
         ):
             user_prompt = make_user_prompt(ticker, data_dict[ticker])
@@ -458,8 +400,6 @@ def main() -> None:
             data_dict[ticker]["expected_return"] = res.samples
             data_dict[ticker]["n_success"] = int(res.n_success)
             data_dict[ticker]["expected_return_mean"] = res.mean
-            # If you want debug later:
-            # data_dict[ticker]["errors"] = res.errors
 
         # Save month results
         with open(out_path, "w") as f:

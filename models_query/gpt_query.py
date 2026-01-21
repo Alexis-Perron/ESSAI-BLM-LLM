@@ -1,21 +1,11 @@
-# gpt_query.py
 from __future__ import annotations
-
 import json
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
-
+from openai import OpenAI
 import numpy as np
-
-try:
-    from openai import OpenAI
-except ImportError as e:
-    raise ImportError(
-        "Le package 'openai' n'est pas installé. Fais: pip install openai"
-    ) from e
-
 
 # -------------------------
 # Public result container
@@ -95,7 +85,6 @@ class GPTQuery:
     Goal:
       - isolate OpenAI-specific code here
       - return clean numeric samples and diagnostics
-      - later you can create llama_query.py etc. with same method signature
     """
 
     def __init__(

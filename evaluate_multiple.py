@@ -20,7 +20,12 @@ def _normalize_ticker(x: str) -> str:
 
 
 def _parse_yyyymmdd_int(x):
-    """filtered_sp500_data.csv often has 'date' like 20210129 (int)."""
+    """
+
+    This function was written by ChatGPT 5.2
+    filtered_sp500_data.csv often has 'date' like 20210129 (int).
+
+    """
     if pd.isna(x):
         return pd.NaT
     try:
@@ -49,12 +54,12 @@ def month_pairs(start: str, end: str) -> List[Tuple[str, str]]:
 # -------------------------
 # Data loaders
 # -------------------------
-def load_market_caps_from_filtered(filtered_csv_path: str, period_end_date: str) -> Dict[str, float]:
+def load_market_caps_from_dataset(dataset_csv_path: str, period_end_date: str) -> Dict[str, float]:
     """
     Build a {tic: market_equity} snapshot using filtered_sp500_data.csv for the month of period_end_date.
     Keeps last available row per ticker in that month.
     """
-    df = pd.read_csv(filtered_csv_path, low_memory=False)
+    df = pd.read_csv(dataset_csv_path, low_memory=False)
 
     required = {"date", "tic", "market_equity"}
     missing = required - set(df.columns)
@@ -315,7 +320,7 @@ def process_period_for_model(
     tau: float,
     returns_dir: str,
     responses_dir: str,
-    filtered_csv_path: str,
+    dataset_csv_path: str,
     risk_free_rate_annual: float = 0.02,
     min_tickers: int = 25,
     debug_beta: bool = False,
@@ -329,7 +334,7 @@ def process_period_for_model(
       - compute equilibrium returns (robust)
       - compute BL weights using LLM views
     """
-    market_caps = load_market_caps_from_filtered(filtered_csv_path, end_date)
+    market_caps = load_market_caps_from_dataset(dataset_csv_path, end_date)
 
     returns_path = Path(returns_dir) / f"returns_{start_date}_{end_date}.csv"
     if not returns_path.exists():
@@ -390,7 +395,7 @@ def main():
 
     parser.add_argument("--returns_dir", type=str, default="yfinance")
     parser.add_argument("--responses_dir", type=str, default="responses")
-    parser.add_argument("--filtered_csv", type=str, default="yfinance/filtered_sp500_data.csv")
+    parser.add_argument("--dataset_csv", type=str, default="yfinance/filtered_sp500_data.csv")
     parser.add_argument("--results_dir", type=str, default="results")
 
     parser.add_argument("--risk_free_rate", type=float, default=0.02)
@@ -425,7 +430,7 @@ def main():
                     tau=float(args.tau),
                     returns_dir=args.returns_dir,
                     responses_dir=args.responses_dir,
-                    filtered_csv_path=args.filtered_csv,
+                    dataset_csv_path=args.dataset_csv,
                     risk_free_rate_annual=float(args.risk_free_rate),
                     min_tickers=int(args.min_tickers),
                     debug_beta=bool(args.debug_beta),
