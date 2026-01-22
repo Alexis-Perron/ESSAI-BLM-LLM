@@ -3,7 +3,7 @@ import calendar
 import json
 from pathlib import Path
 from typing import Dict, Tuple, List
-
+from sklearn.covariance import LedoitWolf
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -49,6 +49,70 @@ def month_pairs(start: str, end: str) -> List[Tuple[str, str]]:
     for d in ms:
         out.append((d.strftime("%Y-%m-%d"), (d + pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d")))
     return out
+def _project_to_psd(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Project symmetric matrix to PSD by eigenvalue clipping."""
+    A = 0.5 * (mat + mat.T)
+    vals, vecs = np.linalg.eigh(A)
+    vals = np.clip(vals, eps, None)
+    return (vecs * vals) @ vecs.T
+
+
+def _robust_covariance_psd(returns_used: pd.DataFrame) -> np.ndarray:
+    """
+    Robust covariance estimation:
+      - Fill NaNs with column means (simple, stable)
+      - Ledoit-Wolf shrinkage -> PSD
+      - Ridge for numerical stability
+      - Fallback: pairwise cov -> PSD projection
+    """
+    X = returns_used.to_numpy(dtype=float)
+    if X.shape[0] < 2 or X.shape[1] < 2:
+        # Too small; return tiny diagonal
+        n = X.shape[1]
+        return np.eye(n, dtype=float) * 1e-6
+
+    # Impute NaNs with column means
+    col_means = np.nanmean(X, axis=0)
+    # If a column is all-NaN, nanmean gives NaN -> set to 0
+    col_means = np.where(np.isfinite(col_means), col_means, 0.0)
+    inds = np.where(~np.isfinite(X))
+    X[inds] = np.take(col_means, inds[1])
+
+    try:
+        lw = LedoitWolf().fit(X)
+        sigma = lw.covariance_.astype(float)
+        sigma = 0.5 * (sigma + sigma.T)
+    except Exception:
+        # Fallback: pairwise covariance then PSD projection
+        sigma = returns_used.cov(min_periods=2).to_numpy(dtype=float)
+        sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+        sigma = _project_to_psd(sigma, eps=1e-12)
+
+    # Ridge regularization (scale-aware)
+    n = sigma.shape[0]
+    tr = float(np.trace(sigma))
+    ridge = (1e-6 * (tr / n)) if (np.isfinite(tr) and tr > 0) else 1e-6
+    sigma = sigma + np.eye(n, dtype=float) * ridge
+    return sigma
+
+
+def _clip_posterior(x: np.ndarray) -> np.ndarray:
+    """
+    Robustly clip posterior returns to avoid numerical explosions dominating the optimizer.
+    Uses MAD-based bounds; falls back to std if MAD ~ 0.
+    """
+    x = np.asarray(x, dtype=float).reshape(-1)
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med)))
+    if np.isfinite(mad) and mad > 1e-12:
+        scale = 1.4826 * mad
+    else:
+        sd = float(np.std(x))
+        scale = sd if (np.isfinite(sd) and sd > 1e-12) else 1.0
+
+    lo = med - 10.0 * scale
+    hi = med + 10.0 * scale
+    return np.clip(x, lo, hi)
 
 
 # -------------------------
@@ -151,47 +215,66 @@ def black_litterman_LLM(
     risk_aversion: float = 0.1,
 ) -> np.ndarray:
     """
-    Black-Litterman with LLM views (Q) from data_dict[ticker]["expected_return"] list of samples.
+    Black-Litterman with LLM views (Q) from data_dict[ticker]["expected_return"] list.
+    Patch:
+      - Robust PSD covariance (Ledoit-Wolf + ridge), fallback to PSD projection
+      - Omega floor to avoid overconfidence
+      - Robust clip of posterior returns
     """
-    Q = []
-    Omega_diag = []
-    keep = []
+    q_map = {}
+    omega_map = {}
 
+    # Build views per ticker
     for t in tickers:
         samples = data_dict.get(t, {}).get("expected_return", None)
         if not isinstance(samples, list) or len(samples) == 0:
             continue
-        samples = pd.to_numeric(pd.Series(samples), errors="coerce").dropna().to_numpy(dtype=float)
-        if samples.size == 0:
+        s = pd.to_numeric(pd.Series(samples), errors="coerce").dropna().to_numpy(dtype=float)
+        if s.size == 0:
             continue
-        q = float(np.mean(samples))
-        v = float(np.var(samples)) if samples.size > 1 else 1e-6
-        Q.append(q)
-        Omega_diag.append(max(v, 1e-8))
-        keep.append(t)
+
+        q = float(np.mean(s))
+        v = float(np.var(s)) if s.size > 1 else 1e-4
+
+        # IMPORTANT: floor Omega to avoid near-zero confidence -> explosions
+        omega_floor = 1e-4  # ~1% monthly std floor (variance)
+        q_map[t] = q
+        omega_map[t] = max(v, omega_floor)
+
+    keep = [t for t in tickers if t in q_map]
 
     if len(keep) < 2:
-        return np.ones(len(tickers), dtype=float) / len(tickers)
+        return np.ones(len(tickers), dtype=float) / max(1, len(tickers))
+
+    # Optionally: drop tickers with basically no return history in this period
+    obs = returns_df[keep].notna().sum(axis=0)
+    keep = [t for t in keep if int(obs.get(t, 0)) >= 2]
+    if len(keep) < 2:
+        return np.ones(len(tickers), dtype=float) / max(1, len(tickers))
 
     returns_used = returns_df[keep].copy()
 
-    # Pairwise covariance; avoids brittle dropna(axis=1)
-    sigma = returns_used.cov(min_periods=2).to_numpy(dtype=float)
-    sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    # Robust PSD covariance
+    sigma = _robust_covariance_psd(returns_used)
 
+    # Align pi, Q, Omega with keep order
     eq_map = dict(zip(tickers, market_equilibrium_return))
     pi = np.array([eq_map.get(t, 0.0) for t in keep], dtype=float)
 
-    P = np.eye(len(keep), dtype=float)
-    Q = np.array(Q, dtype=float)
-    Omega = np.diag(Omega_diag).astype(float)
+    Q = np.array([q_map[t] for t in keep], dtype=float)
+    Omega = np.diag([omega_map[t] for t in keep]).astype(float)
 
+    # Identity P: each view on one asset
+    P = np.eye(len(keep), dtype=float)
+
+    # BL posterior
     tau_sigma = tau * sigma
     inv_tau_sigma = np.linalg.pinv(tau_sigma)
     inv_Omega = np.linalg.pinv(Omega)
     M = np.linalg.pinv(inv_tau_sigma + P.T @ inv_Omega @ P)
 
     posterior_returns = M @ (inv_tau_sigma @ pi + P.T @ inv_Omega @ Q)
+    posterior_returns = _clip_posterior(posterior_returns)
 
     # Mean-variance optimisation (long-only, fully invested)
     def portfolio_variance(w, cov_matrix):
@@ -204,6 +287,7 @@ def black_litterman_LLM(
         {"type": "eq", "fun": lambda x: np.sum(x) - 1.0},
         {"type": "ineq", "fun": lambda x: x},
     )
+
     bounds = tuple((0.0, 1.0) for _ in range(len(keep)))
     x0 = np.ones(len(keep), dtype=float) / len(keep)
 
@@ -227,6 +311,7 @@ def black_litterman_LLM(
     if s > 0:
         w_full = w_full / s
     return w_full
+
 
 
 # -------------------------
