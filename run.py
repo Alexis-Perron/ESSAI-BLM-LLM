@@ -19,10 +19,6 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# -------------------------
-# Model routing
-# -------------------------
-
 MODEL_MAP = {
     "gemma3": "gemma3",
     "qwen": "qwen2.5:1.5b",
@@ -135,8 +131,7 @@ def ensure_returns_csv_for_period(
     period_end: str,
     global_start: str,
     global_end: str,
-    lookback_months: int,
-    overwrite: bool = False,
+    overwrite: bool = False
 ) -> str:
     """
     Create the file expected by evaluate_multiple_updated.py:
@@ -176,7 +171,7 @@ def ensure_returns_csv_for_period(
 # -------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
-    # Model selector (also used as output filename prefix).
+    # Model selector
     # Examples:
     #   --model_name gpt    (OpenAI; uses --openai_model)
     #   --model_name gemma3 (Ollama; uses local Gemma3)
@@ -190,46 +185,34 @@ def main() -> None:
         default=os.getenv("OLLAMA_HOST", "http://localhost:11434")
     )
     parser.add_argument("--input_csv", type=str, default="yfinance/filtered_sp500_data.csv")
-
     parser.add_argument("--start", type=str, default="2021-01-01")
-    parser.add_argument("--end", type=str, default="2022-06-30")
-
+    parser.add_argument("--end", type=str, default="2025-06-30")
     parser.add_argument("--n_samples", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--lookback_months", type=int, default=12)
-
     parser.add_argument("--overwrite", action="store_true", help="Recompute months even if output json exists.")
-
-    # returns csv generation
-    parser.add_argument("--returns_lookback_months", type=int, default=24)
 
     args = parser.parse_args()
 
     model_name = str(args.model_name).strip().lower()
 
-    # Output prefix = model_name (keeps file names stable and short)
-    out_prefix = model_name
-
     model_id = MODEL_MAP[model_name]
 
     os.makedirs("responses", exist_ok=True)
 
-    # -------------------------
-    # Build LLM client (lazy imports)
-    # -------------------------
+    # ----------------
+    # Build LLM client
+    # ----------------
     if model_name == "gpt":
         try:
-            from keys import gpt_key  # type: ignore
+            from keys import gpt_key
         except Exception as e:
             raise RuntimeError(
                 "Can't import gpt_key from keys.py."
             ) from e
 
         try:
-            try:
-                from models_query.gpt_query import GPTQuery  # type: ignore
-            except Exception:
-                from gpt_query import GPTQuery  # type: ignore
+            from models_query.gpt_query import GPTQuery
         except Exception as e:
             raise RuntimeError("Impossible d'importer GPTQuery. Fais: pip install openai") from e
 
@@ -242,10 +225,7 @@ def main() -> None:
 
     elif model_name == "qwen":
         try:
-            try:
-                from models_query.qwen_query import QwenQuery  # type: ignore
-            except Exception:
-                from qwen_query import QwenQuery  # type: ignore
+            from models_query.qwen_query import QwenQuery
         except Exception as e:
             raise RuntimeError("Impossible d'importer QwenQuery.") from e
 
@@ -258,10 +238,7 @@ def main() -> None:
 
     elif model_name == "gemma3":
         try:
-            try:
-                from models_query.gemma_query import GemmaQuery  # type: ignore
-            except Exception:
-                from gemma_query import GemmaQuery  # type: ignore
+            from models_query.gemma_query import GemmaQuery
         except Exception as e:
             raise RuntimeError("Impossible d'importer GemmaQuery.") from e
 
@@ -319,7 +296,7 @@ def main() -> None:
         month_start = month_start_dt.strftime("%Y-%m-%d")
         month_end = month_end_dt.strftime("%Y-%m-%d")
 
-        out_path = f"responses/{out_prefix}_{month_start}_{month_end}.json"
+        out_path = f"responses/{model_name}_{month_start}_{month_end}.json"
         already = os.path.exists(out_path)
 
         # Always ensure returns csv exists for eval script
@@ -327,10 +304,8 @@ def main() -> None:
             sp500_table=sp500_table,
             period_start=month_start,
             period_end=month_end,
-            window_mode=args.returns_window_mode,
             global_start=args.start,
             global_end=args.end,
-            lookback_months=args.returns_lookback_months,
             overwrite=args.overwrite,  # if overwriting, also overwrite returns file
         )
 

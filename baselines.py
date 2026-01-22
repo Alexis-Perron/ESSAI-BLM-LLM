@@ -1,16 +1,6 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 Baselines portfolios computed from ONE master file: yfinance/filtered_sp500_data.csv
 
-Key changes vs prior version:
-- Uses MONTHLY panel: last observation per (tic, ym) from filtered_sp500_data.csv
-- Adds min_train_rows (default 12) and will expand history backward to reach it if possible
-- Does NOT reduce the universe by market cap (no top-N filtering)
-- Still outputs one CSV per training month:
-    responses_portfolios/equal_weighted_portfolio_<train_start>_<train_end>.csv
-    responses_portfolios/optimized_portfolio_<train_start>_<train_end>.csv
 """
 
 import argparse
@@ -187,7 +177,7 @@ def main():
     ap.add_argument("--out_dir", type=str, default="responses_portfolios")
 
     ap.add_argument("--start", type=str, default="2021-01-01")
-    ap.add_argument("--end", type=str, default="2022-06-30")
+    ap.add_argument("--end", type=str, default="2025-06-30")
 
     ap.add_argument("--lookback_months", type=int, default=12)
     ap.add_argument("--min_train_rows", type=int, default=12, help="Minimum months required to run MVO optimization.")
@@ -356,7 +346,6 @@ def main():
             w_opt = w_eq
 
         else:
-            # === NEW: completeness filter for MVO (not a market-cap filter) ===
             obs = train_R.notna().sum(axis=0)
 
             keep_cols = obs[obs >= min_train_rows].index

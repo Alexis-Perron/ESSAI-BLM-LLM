@@ -306,7 +306,7 @@ def summarize_year(
         if col not in df.columns:
             df[col] = pd.NA
 
-    schema_version = "v3_structured_summary_2026-01-07"
+    schema_version = "structured_summary"
 
     it = tqdm(range(len(df)), desc=f"Summarizing {year}", unit="row")
     for i in it:

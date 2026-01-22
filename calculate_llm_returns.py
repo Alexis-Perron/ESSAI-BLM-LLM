@@ -258,10 +258,10 @@ def calculate_model_returns(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--models", nargs="+", default=["gpt gemma3_1b qwen"], help="List of model names (e.g., gpt gemma qwen).")
+    p.add_argument("--models", nargs="+", default=["gpt gemma3 qwen"], help="List of model names (e.g., gpt gemma qwen).")
     p.add_argument("--tau", type=float, default=0.025)
     p.add_argument("--start", type=str, default="2021-01-01")
-    p.add_argument("--end", type=str, default="2023-06-30")
+    p.add_argument("--end", type=str, default="2025-06-30")
     p.add_argument("--returns_dir", type=str, default="yfinance")
     p.add_argument("--results_dir", type=str, default="results")
 
