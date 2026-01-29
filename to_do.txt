@@ -1,3 +1,6 @@
 - Ajouter niveau de confiance des prédictions LLMS (std des prédictions) (présentement, on utilise slm la moyenne des différentes réponses)
 - Ajouter utilisation de série temporelle de taux sans risque US, au lieu d'une constante
-- Ajouter d'autres modèles LLM
+- Ajouter d'autres modèles LLM x
+- S'assurer que l'optimisation faite dans baselines pour MVO est la même que dans BL
+- Ajouter un portefeuille market equilibrium (BL sans vues de marché pour comparer la valeur ajoutée des vues générées par LLM) x
+- Ajouter un portefeuille BL multi-llm
