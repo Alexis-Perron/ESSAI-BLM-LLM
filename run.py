@@ -22,7 +22,8 @@ from tqdm import tqdm
 MODEL_MAP = {
     "gemma3": "gemma3",
     "qwen": "qwen2.5:1.5b",
-    "gpt": "gpt-4o-mini"
+    "gpt": "gpt-4o-mini",
+    "llama": "llama3.2",
 }
 
 # -------------------------
@@ -91,82 +92,6 @@ def make_user_prompt(ticker: str, row: dict) -> str:
 
 
 # -------------------------
-# Returns CSV builder (from filtered_sp500_data.csv)
-# -------------------------
-def build_returns_matrix_monthly(
-    sp500_table: pd.DataFrame,
-    window_start: pd.Timestamp,
-    window_end: pd.Timestamp,
-) -> pd.DataFrame:
-    """
-    Build a MONTHLY returns matrix (1 row per month):
-      - index = ym (YYYY-MM as string)
-      - columns = tickers
-      - values = stock_ret (monthly returns)
-    Keep the last available date within each (ticker, month).
-    """
-    df = sp500_table.loc[
-        (sp500_table["date_key"] >= window_start) & (sp500_table["date_key"] <= window_end),
-        ["date_key", "tic", "stock_ret"],
-    ].copy()
-
-    df = df.dropna(subset=["date_key", "tic"])
-    df["stock_ret"] = pd.to_numeric(df["stock_ret"], errors="coerce")
-
-    # month key
-    df["ym"] = df["date_key"].dt.to_period("M")
-
-    # keep last obs within month per ticker
-    df = df.sort_values(["tic", "date_key"]).drop_duplicates(subset=["tic", "ym"], keep="last")
-
-    mat = df.pivot(index="ym", columns="tic", values="stock_ret").sort_index()
-    mat.index = mat.index.astype(str)  # "YYYY-MM"
-    mat = mat.reset_index().rename(columns={"ym": "ym"})  # make 'ym' a column
-    return mat
-
-
-def ensure_returns_csv_for_period(
-    sp500_table: pd.DataFrame,
-    period_start: str,
-    period_end: str,
-    global_start: str,
-    global_end: str,
-    overwrite: bool = False
-) -> str:
-    """
-    Create the file expected by evaluate_multiple_updated.py:
-        yfinance/returns_<period_start>_<period_end>.csv
-    """
-    os.makedirs('yfinance', exist_ok=True)
-    out_path = os.path.join('yfinance', f"returns_{period_start}_{period_end}.csv")
-
-    if (not overwrite) and os.path.exists(out_path):
-        return out_path
-
-    data_min = sp500_table["date_key"].min()
-    data_max = sp500_table["date_key"].max()
-
-    g_start = pd.to_datetime(global_start)
-    g_end = pd.to_datetime(global_end)
-
-    w_start, w_end = g_start, g_end
-
-    # clamp to available data
-    w_start = max(w_start, data_min)
-    w_end = min(w_end, data_max)
-
-    mat = build_returns_matrix_monthly(sp500_table, w_start, w_end)
-
-    # fallback: if too short window, use full range inside [global_start, global_end]
-    if mat.shape[0] < 2:
-        w_start2, w_end2 = max(g_start, data_min), min(g_end, data_max)
-        mat = build_returns_matrix_monthly(sp500_table, w_start2, w_end2)
-
-    mat.to_csv(out_path, index=False)
-    return out_path
-
-
-# -------------------------
 # Main
 # -------------------------
 def main() -> None:
@@ -184,8 +109,8 @@ def main() -> None:
         type=str,
         default=os.getenv("OLLAMA_HOST", "http://localhost:11434")
     )
-    parser.add_argument("--input_csv", type=str, default="yfinance/filtered_sp500_data.csv")
-    parser.add_argument("--start", type=str, default="2021-01-01")
+    parser.add_argument("--input_csv", type=str, default="data/filtered_sp500_data.csv")
+    parser.add_argument("--start", type=str, default="2014-01-01")
     parser.add_argument("--end", type=str, default="2025-06-30")
     parser.add_argument("--n_samples", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.5)
@@ -249,6 +174,20 @@ def main() -> None:
             retry_backoff_s=1.0,
         )
 
+    elif model_name == "llama":
+        try:
+            from models_query.llama_query import Llama_Query
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer Llama_Query.") from e
+
+        llm = Llama_Query(
+            model=model_id,
+            host=args.ollama_host,
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
@@ -298,16 +237,6 @@ def main() -> None:
 
         out_path = f"responses/{model_name}_{month_start}_{month_end}.json"
         already = os.path.exists(out_path)
-
-        # Always ensure returns csv exists for eval script
-        ensure_returns_csv_for_period(
-            sp500_table=sp500_table,
-            period_start=month_start,
-            period_end=month_end,
-            global_start=args.start,
-            global_end=args.end,
-            overwrite=args.overwrite,  # if overwriting, also overwrite returns file
-        )
 
         if already and (not args.overwrite):
             continue

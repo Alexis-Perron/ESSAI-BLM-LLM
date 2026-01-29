@@ -1,5 +1,5 @@
 """
-Baselines portfolios computed from ONE master file: yfinance/filtered_sp500_data.csv
+Baselines portfolios computed from ONE master file: data/filtered_sp500_data.csv
 
 """
 
@@ -173,10 +173,10 @@ def _debug_opt_diagnostics(train_R: pd.DataFrame, debug_top: int = 15) -> None:
 # ----------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--master_path", type=str, default="yfinance/filtered_sp500_data.csv")
+    ap.add_argument("--master_path", type=str, default="data/filtered_sp500_data.csv")
     ap.add_argument("--out_dir", type=str, default="responses_portfolios")
 
-    ap.add_argument("--start", type=str, default="2021-01-01")
+    ap.add_argument("--start", type=str, default="2015-01-01")
     ap.add_argument("--end", type=str, default="2025-06-30")
 
     ap.add_argument("--lookback_months", type=int, default=12)

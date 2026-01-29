@@ -1,5 +1,16 @@
 # Project for my Master's essay based on the Black-Litterman Model - LLM project written by Youngbin Lee, Yejin Kim and Juhyeong Kim (https://github.com/youngandbin/LLM-BLM)
  - The main improvement to add is in the input data fed to LLMs. Instead of only using historical price data, we can enhance the input by including yearly and quarterly financial statements.
+ 
+ - High level list of changes made to the original project:
+    - Changed usage of yfinance to instead use dataset from McGill-Fiam Hackathon 2025 for returns data.
+       - This dataset is monthly instead of daily. Therefore, the portfolio is rebalanced monthly instead of bi-weekly like originally.
+    - Added yearly and quarterly financial statements data as input to LLMs.
+    - Extended the time period of analysis from January 2015 to June 2025.
+    - Used different versions of LLM models (gpt-4o-mini was ran on OpenAI servers and the others locally).
+    - Added a new step in the pipeline: summarize_text_reports.py to summarize financial statements before feeding them to LLMs through GPT-4o-mini.
+    - Changed name of some files to better reflect their purpose.
+    - Added a Viewless Black-Litterman portfolio as a benchmark.
+
  - The readme from the original repository is as follows:
 
 # Integrating LLM-Generated Views into Mean-Variance Optimization Using the Black-Litterman Model 

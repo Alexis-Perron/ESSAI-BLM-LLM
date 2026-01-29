@@ -16,7 +16,7 @@ Input (example columns from text_us_2005.pkl):
 
 Output:
 - Same rows + all original columns preserved.
-- mgmt is replaced with the structured "summary" text (150–200 words).
+- mgmt is replaced with the structured "summary" text (150-200 words).
 - rf is replaced with a compact block containing bullish/bearish bullets + guidance_change + risk_level.
 - mgmt_size and rf_size are recalculated.
 - Adds optional convenience columns:
@@ -251,6 +251,102 @@ def _compact_rf_block(bull: list[str], bear: list[str], guidance: str, risk: int
     out.append(f"Guidance change: {guidance}")
     out.append(f"Risk level: {risk}/5")
     return "\n".join(out)
+# -----------------------------
+# S&P 500 filtering via gvkey (data/filtered_sp500_data.csv)
+# -----------------------------
+def _normalize_gvkey(x: Any) -> str:
+    """
+    Normalize gvkey identifiers for matching across datasets.
+
+    The .pkl files often store gvkey as float (e.g., 1234.0). We convert to a
+    clean string key (e.g., "1234").
+    """
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    # Try numeric normalization first
+    try:
+        # Handles floats like 1234.0 and strings like "1234.0"
+        xi = int(float(x))
+        return str(xi)
+    except Exception:
+        s = str(x).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
+
+
+def _infer_year_series(df: pd.DataFrame, *, year_col: Optional[str] = None, date_col: Optional[str] = None) -> pd.Series:
+    """
+    Infer a year Series from a dataframe using either an explicit year column,
+    or a date-like column whose first 4 digits represent the year.
+    """
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    # Explicit year column
+    if year_col and year_col in df.columns:
+        y = pd.to_numeric(df[year_col], errors="coerce")
+        return y.astype("Int64")
+
+    for cand in ["year", "fyear", "fiscal_year"]:
+        if cand in cols_lower:
+            y = pd.to_numeric(df[cols_lower[cand]], errors="coerce")
+            return y.astype("Int64")
+
+    # Date column
+    if date_col and date_col in df.columns:
+        s = df[date_col]
+    else:
+        for cand in ["date", "datadate", "char_date", "rdq", "adate", "caldt"]:
+            if cand in cols_lower:
+                s = df[cols_lower[cand]]
+                break
+        else:
+            raise ValueError(
+                "Cannot infer year from filtered_sp500_data.csv: no year/date column found. "
+                f"Columns: {list(df.columns)}"
+            )
+
+    # Parse year from common formats
+    s = s.astype(str).str.strip()
+    # If it's like 20050104, year = first 4 chars
+    year = pd.to_numeric(s.str.slice(0, 4), errors="coerce")
+    return year.astype("Int64")
+
+
+def _load_sp500_gvkeys_for_year(
+    year: int,
+    csv_path: Path,
+    *,
+    gvkey_col: Optional[str] = None,
+    year_col: Optional[str] = None,
+    date_col: Optional[str] = None,
+) -> set[str]:
+    """
+    Load the set of gvkeys that are in the S&P 500 (as represented by the
+    data filtered dataset) for the given calendar year.
+    """
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Missing S&P500 gvkey dataset: {csv_path}")
+
+    dfx = pd.read_csv(csv_path)
+
+    cols_lower = {c.lower(): c for c in dfx.columns}
+    if gvkey_col and gvkey_col in dfx.columns:
+        gcol = gvkey_col
+    elif "gvkey" in cols_lower:
+        gcol = cols_lower["gvkey"]
+    else:
+        raise ValueError(
+            "filtered_sp500_data.csv must contain a gvkey column. "
+            f"Columns: {list(dfx.columns)}"
+        )
+
+    years = _infer_year_series(dfx, year_col=year_col, date_col=date_col)
+    mask = years == int(year)
+
+    gv = dfx.loc[mask, gcol].map(_normalize_gvkey)
+    return {x for x in gv.tolist() if x}
+
 
 
 # -----------------------------
@@ -267,6 +363,10 @@ def summarize_year(
     save_every: int,
     cache_path: Path,
     retry_cfg: RetryConfig,
+    sp500_csv: Path,
+    sp500_gvkey_col: Optional[str] = None,
+    sp500_year_col: Optional[str] = None,
+    sp500_date_col: Optional[str] = None,
     max_rows: Optional[int] = None,
 ) -> Path:
     _ensure_numpy_core_alias()
@@ -294,6 +394,21 @@ def summarize_year(
 
     if ckpt_path.exists():
         df = pd.read_pickle(ckpt_path)
+
+    # Filter to S&P 500 constituents (by gvkey) for this year
+    allowed_gvkeys = _load_sp500_gvkeys_for_year(
+        year,
+        csv_path=sp500_csv,
+        gvkey_col=sp500_gvkey_col,
+        year_col=sp500_year_col,
+        date_col=sp500_date_col,
+    )
+
+    before = len(df)
+    df_gv = df["gvkey"].map(_normalize_gvkey)
+    df = df.loc[df_gv.isin(allowed_gvkeys)].copy()
+    after = len(df)
+    print(f"[INFO] {year}: filtered using S&P500 gvkeys: {before} -> {after} rows")
 
     # Ensure size columns exist
     if "mgmt_size" not in df.columns:
@@ -375,12 +490,46 @@ def summarize_year(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_template", type=str, required=True,
-                        help=r"Path template with {year}, e.g. C:\...\{year}\text_us_{year}.pkl")
-    parser.add_argument("--output_root", type=str, required=True, default="\TEXT DATA US SUMMARIZED",
-                        help="Output root directory. Will create one folder per year.")
-    parser.add_argument("--start_year", type=int, default=2021)
-    parser.add_argument("--end_year", type=int, default=2025)
+
+    parser.add_argument(
+        "--input_template",
+        type=str,
+        default=r"C:\Users\alexi\OneDrive\Documents\école\McGill-FIAM\2025\Hackathon-Final-2025\DATA ASSET MANAGEMENT HACKATHON 2025 FINALS\TEXT DATA US by YEAR\{year}\text_us_{year}.pkl"
+    )
+
+    parser.add_argument(
+        "--output_root",
+        type=str,
+        default=r"C:\Users\alexi\OneDrive\Documents\école\McGill-FIAM\2025\Hackathon-Final-2025\DATA ASSET MANAGEMENT HACKATHON 2025 FINALS\TEXT DATA US SUMMARIZED"
+    )
+
+    # Filter universe using gvkey membership from data/filtered_sp500_data.csv
+    parser.add_argument(
+        "--sp500_gvkey_csv",
+        type=str,
+        default=r"data/filtered_sp500_data.csv",
+        help="CSV containing S&P 500 (filtered) universe with a gvkey column; used to filter per year."
+    )
+    parser.add_argument(
+        "--sp500_gvkey_col",
+        type=str,
+        default="",
+        help="Optional name of the gvkey column in --sp500_gvkey_csv (auto-detected if empty)."
+    )
+    parser.add_argument(
+        "--sp500_year_col",
+        type=str,
+        default="",
+        help="Optional name of the year column in --sp500_gvkey_csv (auto-detected if empty)."
+    )
+    parser.add_argument(
+        "--sp500_date_col",
+        type=str,
+        default="",
+        help="Optional name of the date column (YYYYMMDD/ISO) in --sp500_gvkey_csv to infer year (auto-detected if empty)."
+    )
+    parser.add_argument("--start_year", type=int, default=2015)
+    parser.add_argument("--end_year", type=int, default=2018)
 
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -397,6 +546,16 @@ def main() -> None:
     parser.add_argument("--max_sleep", type=float, default=30.0)
 
     args = parser.parse_args()
+
+    script_dir = Path(__file__).resolve().parent
+
+    sp500_csv = Path(args.sp500_gvkey_csv)
+    if not sp500_csv.is_absolute():
+        sp500_csv = (script_dir / sp500_csv).resolve()
+
+    sp500_gvkey_col = str(args.sp500_gvkey_col).strip() or None
+    sp500_year_col = str(args.sp500_year_col).strip() or None
+    sp500_date_col = str(args.sp500_date_col).strip() or None
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -418,6 +577,10 @@ def main() -> None:
             save_every=args.save_every,
             cache_path=cache_path,
             retry_cfg=retry_cfg,
+            sp500_csv=sp500_csv,
+            sp500_gvkey_col=sp500_gvkey_col,
+            sp500_year_col=sp500_year_col,
+            sp500_date_col=sp500_date_col,
             max_rows=max_rows,
         )
         print(f"[OK] Wrote: {out_path}")
