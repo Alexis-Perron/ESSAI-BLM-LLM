@@ -10,6 +10,8 @@
     - Added a new step in the pipeline: summarize_text_reports.py to summarize financial statements before feeding them to LLMs through GPT-4o-mini.
     - Changed name of some files to better reflect their purpose.
     - Added a Viewless Black-Litterman portfolio as a benchmark.
+    - Reduced the number of requests to LLMs from 30 to 5 per stock per month to reduce costs and speed up the process. (We input more data so responses take longer to generate).
+       - The dispersion of response is therefore computed on only 5 responses instead of 30.
 
  - The readme from the original repository is as follows:
 
