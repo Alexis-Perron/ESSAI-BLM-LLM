@@ -68,6 +68,8 @@ def make_system_prompt() -> str:
         "Given a time-series of PAST MONTHLY returns (decimal returns, e.g. 0.02 = +2%), "
         "company metadata, and optionally a recent summarized filing payload (summary_json), "
         "predict the expected MONTHLY return (decimal) for the NEXT month. "
+        "If you would output a percent (e.g., 2 for 2%), convert it to decimal (0.02). "
+        "Expected return should be a decimal in the range [-1, 1]. "
         'Return ONLY valid JSON that matches this schema: {"expected_return": number}. '
         "Do not include any extra keys or text."
     )
@@ -204,15 +206,27 @@ def main() -> None:
     sp500_table["month"] = pd.to_numeric(sp500_table["month"], errors="coerce").astype("Int64")
     sp500_table["stock_ret"] = pd.to_numeric(sp500_table["stock_ret"], errors="coerce")
 
-    sp500_table["date_key"] = parse_yyyymmdd_int_to_datetime(sp500_table["date"])
-    sp500_table = sp500_table.dropna(subset=["date_key", "year", "month", "tic"]).copy()
+    # Decision date: use char_date when available (info month), else fall back to date.
+    use_char_date = "char_date" in sp500_table.columns
+    if use_char_date:
+        sp500_table["decision_date"] = parse_yyyymmdd_int_to_datetime(sp500_table["char_date"])
+    else:
+        sp500_table["decision_date"] = parse_yyyymmdd_int_to_datetime(sp500_table["date"])
 
-    sp500_table["ym"] = pd.to_datetime(
-        dict(year=sp500_table["year"].astype(int), month=sp500_table["month"].astype(int), day=1),
-        errors="coerce",
-    ).dt.to_period("M")
+    sp500_table = sp500_table.dropna(subset=["decision_date", "tic"]).copy()
+
+    # Month key for decision month
+    sp500_table["ym"] = sp500_table["decision_date"].dt.to_period("M")
 
     sp500_table["tic"] = normalize_ticker_series(sp500_table["tic"])
+
+    # If we are using char_date as decision month, stock_ret is t+1 by construction.
+    # Shift by 1 month per ticker so past_returns are strictly <= decision month.
+    if use_char_date:
+        sp500_table = sp500_table.sort_values(["tic", "ym", "decision_date"])
+        sp500_table["realized_ret"] = sp500_table.groupby("tic")["stock_ret"].shift(1)
+    else:
+        sp500_table["realized_ret"] = sp500_table["stock_ret"]
 
     # Optional metadata columns
     company_col = "conm" if "conm" in sp500_table.columns else None
@@ -255,31 +269,33 @@ def main() -> None:
         hist_start_p = current_p - (lb - 1)
         hdf = sp500_table.loc[
             (sp500_table["ym"] >= hist_start_p) & (sp500_table["ym"] <= current_p),
-            ["ym", "tic", "stock_ret"],
+            ["ym", "tic", "realized_ret"],
         ].copy()
 
-        hdf = hdf.dropna(subset=["stock_ret"])
+        hdf = hdf.dropna(subset=["realized_ret"])
         hdf = hdf.sort_values(["tic", "ym"])
-        hist_map = hdf.groupby("tic")["stock_ret"].apply(list).to_dict()
+        hist_map = hdf.groupby("tic")["realized_ret"].apply(list).to_dict()
 
         data_dict: dict[str, dict] = {}
 
         for tic, g in mdf.groupby("tic", sort=False):
+            g = g.sort_values("decision_date")
+            last = g.iloc[-1]
             past_returns = hist_map.get(tic, [])
 
-            summary_json_val = g[summary_json_col].iloc[0] if summary_json_col else ""
+            summary_json_val = last[summary_json_col] if summary_json_col else ""
             if pd.isna(summary_json_val):
                 summary_json_val = ""
             else:
                 summary_json_val = str(summary_json_val)
 
             row = {
-                "company_name": g[company_col].iloc[0] if company_col else "",
-                "gics_sector_name": g[sector_name_col].iloc[0] if sector_name_col else "",
-                "gics": g[gics_col].iloc[0] if gics_col else "",
-                "sic": g[sic_col].iloc[0] if sic_col else "",
-                "naics": g[naics_col].iloc[0] if naics_col else "",
-                "market_equity": float(g[market_equity_col].iloc[0]) if market_equity_col else "",
+                "company_name": last[company_col] if company_col else "",
+                "gics_sector_name": last[sector_name_col] if sector_name_col else "",
+                "gics": last[gics_col] if gics_col else "",
+                "sic": last[sic_col] if sic_col else "",
+                "naics": last[naics_col] if naics_col else "",
+                "market_equity": float(last[market_equity_col]) if market_equity_col else "",
                 "past_returns": [float(x) for x in past_returns if pd.notna(x)],
                 "summary_json": summary_json_val,
             }

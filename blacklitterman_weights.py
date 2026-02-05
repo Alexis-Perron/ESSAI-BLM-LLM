@@ -11,6 +11,10 @@ from tqdm import tqdm
 LOOKBACK_MONTHS = 60  # trailing months used to estimate cov/betas (including current month)
 MIN_RET_ROWS = 2        # minimum months required to run estimation
 
+# View calibration guardrails
+OMEGA_FLOOR = 1e-4
+MIN_VIEW_SAMPLES = 10
+
 # -------------------------
 # Ticker / date utils
 # -------------------------
@@ -58,11 +62,10 @@ def _project_to_psd(mat: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 
 def _robust_covariance_psd(returns_used: pd.DataFrame) -> np.ndarray:
     """
-    Robust covariance estimation:
-      - Fill NaNs with column means (simple, stable)
-      - Ledoit-Wolf shrinkage -> PSD
+    Robust covariance estimation (straightforward):
+      - Pairwise covariance (no imputation)
+      - PSD projection
       - Ridge for numerical stability
-      - Fallback: pairwise cov -> PSD projection
     """
     X = returns_used.to_numpy(dtype=float)
     if X.shape[0] < 2 or X.shape[1] < 2:
@@ -70,22 +73,10 @@ def _robust_covariance_psd(returns_used: pd.DataFrame) -> np.ndarray:
         n = X.shape[1]
         return np.eye(n, dtype=float) * 1e-6
 
-    # Impute NaNs with column means
-    col_means = np.nanmean(X, axis=0)
-    # If a column is all-NaN, nanmean gives NaN -> set to 0
-    col_means = np.where(np.isfinite(col_means), col_means, 0.0)
-    inds = np.where(~np.isfinite(X))
-    X[inds] = np.take(col_means, inds[1])
-
-    try:
-        lw = LedoitWolf().fit(X)
-        sigma = lw.covariance_.astype(float)
-        sigma = 0.5 * (sigma + sigma.T)
-    except Exception:
-        # Fallback: pairwise covariance then PSD projection
-        sigma = returns_used.cov(min_periods=2).to_numpy(dtype=float)
-        sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
-        sigma = _project_to_psd(sigma, eps=1e-12)
+    # Pairwise covariance (min_periods=2)
+    sigma = returns_used.cov(min_periods=2).to_numpy(dtype=float)
+    sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    sigma = _project_to_psd(sigma, eps=1e-12)
 
     # Ridge regularization (scale-aware)
     n = sigma.shape[0]
@@ -111,6 +102,39 @@ def _clip_posterior(x: np.ndarray) -> np.ndarray:
     lo = med - 10.0 * scale
     hi = med + 10.0 * scale
     return np.clip(x, lo, hi)
+
+def _robust_view_stats(samples: np.ndarray) -> tuple[float, float, int]:
+    """
+    Robust mean/variance for LLM view samples with small-n protection.
+    - Winsorize around median using MAD/STD scale
+    - Inflate variance when n is small to avoid overconfidence
+    """
+    s = np.asarray(samples, dtype=float).reshape(-1)
+    s = s[np.isfinite(s)]
+    n = int(s.size)
+    if n == 0:
+        raise ValueError("No valid samples.")
+
+    med = float(np.median(s))
+    mad = float(np.median(np.abs(s - med)))
+    if np.isfinite(mad) and mad > 1e-12:
+        scale = 1.4826 * mad
+    else:
+        sd = float(np.std(s))
+        scale = sd if (np.isfinite(sd) and sd > 1e-12) else 1.0
+
+    lo = med - 5.0 * scale
+    hi = med + 5.0 * scale
+    s2 = np.clip(s, lo, hi)
+
+    q = float(np.mean(s2))
+    v = float(np.var(s2, ddof=1)) if n > 1 else OMEGA_FLOOR
+
+    if n < MIN_VIEW_SAMPLES:
+        v *= (MIN_VIEW_SAMPLES / max(1, n))
+
+    v = max(v, OMEGA_FLOOR)
+    return q, v, n
 
 # -------------------------
 # Data loaders
@@ -240,6 +264,81 @@ def load_llm_responses(responses_path: str) -> Dict[str, dict]:
         out[_normalize_ticker(k)] = v
     return out
 
+
+# -------------------------
+# Risk-free rate loader (dynamic)
+# -------------------------
+def load_risk_free_monthly_annual(rf_csv_path: str) -> pd.Series:
+    """
+    Load a risk-free rate CSV (e.g., FRED DGS10) and return a *monthly* series of
+    annualized yields in decimal form, indexed by month-end timestamps.
+
+    The CSV is expected to contain:
+      - a date column named 'DATE' (typical FRED export), and
+      - a value column (e.g., 'DGS10') representing an annualized yield in percent.
+
+    Notes
+    -----
+    - FRED DGS10 values are in percent (e.g., 4.25 means 4.25%).
+    - We convert to decimal (0.0425) and resample to month-end using the last available
+      observation in each month.
+    """
+    df = pd.read_csv(rf_csv_path)
+    # Robustly identify columns
+    date_col = "DATE" if "DATE" in df.columns else df.columns[0]
+    val_cols = [c for c in df.columns if c != date_col]
+    if not val_cols:
+        raise ValueError(f"Risk-free CSV has no value column besides '{date_col}'.")
+    val_col = val_cols[0]
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+
+    df = df.dropna(subset=[date_col, val_col]).sort_values(date_col)
+    if df.empty:
+        raise ValueError("Risk-free CSV contains no valid (date, value) rows.")
+
+    # Convert percent -> decimal
+    s = df.set_index(date_col)[val_col].astype(float) / 100.0
+
+    # Month-end (annualized) yield, last observation in month
+    s_m = s.resample("M").last()
+    # Ensure month-end timestamps (no timezone)
+    s_m.index = s_m.index.to_period("M").to_timestamp("M")
+    return s_m
+
+
+def align_monthly_rf_to_returns_index(rf_monthly_annual: pd.Series, returns_index: pd.Index) -> pd.Series:
+    """
+    Align a monthly *annualized* risk-free series to the index of a monthly returns matrix,
+    and convert it to a monthly risk-free return approximation (annual/12).
+
+    Parameters
+    ----------
+    rf_monthly_annual : pd.Series
+        Monthly annualized yields in decimal form, indexed by month-end timestamps.
+    returns_index : pd.Index
+        Index of the monthly returns matrix (month-end timestamps, may include time component).
+
+    Returns
+    -------
+    pd.Series
+        Monthly risk-free rate (decimal), indexed exactly like returns_index.
+    """
+    # Convert returns index to month-end dates (normalize time component)
+    idx_m = pd.to_datetime(returns_index).to_period("M").to_timestamp("M")
+
+    rf = rf_monthly_annual.copy()
+    rf.index = pd.to_datetime(rf.index).to_period("M").to_timestamp("M")
+
+    aligned_annual = rf.reindex(idx_m).ffill().bfill()
+    # Monthly approximation
+    aligned_monthly = aligned_annual / 12.0
+    aligned_monthly.index = returns_index
+    return aligned_monthly
+
+
+
 # -------------------------
 # Black-Litterman core
 # -------------------------
@@ -314,13 +413,9 @@ def black_litterman_LLM(
         if s.size == 0:
             continue
 
-        q = float(np.mean(s))
-        v = float(np.var(s)) if s.size > 1 else 1e-4
-
-        # IMPORTANT: floor Omega to avoid near-zero confidence -> explosions
-        omega_floor = 1e-4  # ~1% monthly std floor (variance)
+        q, v, _n = _robust_view_stats(s)
         q_map[t] = q
-        omega_map[t] = max(v, omega_floor)
+        omega_map[t] = v
 
     keep = [t for t in tickers if t in q_map]
 
@@ -428,7 +523,7 @@ def black_litterman_no_views(
 def compute_market_equilibrium_returns(
     returns_df: pd.DataFrame,
     market_caps: Dict[str, float],
-    risk_free_rate_annual: float = 0.02,
+    risk_free_monthly: pd.Series | None = None,
     debug_tag: str = "",
     debug_beta: bool = False,
     debug_beta_max: int = 10,
@@ -453,7 +548,12 @@ def compute_market_equilibrium_returns(
     # cap-weighted market return
     mkt = (returns_df[common].mul(w_mkt, axis=1)).sum(axis=1)
 
-    rf = risk_free_rate_annual / 12.0
+    # Dynamic risk-free (monthly) aligned to market series.
+    # If not provided, we fallback to 0 (should not happen in normal runs).
+    if risk_free_monthly is None:
+        rf_series = pd.Series(0.0, index=mkt.index, dtype=float)
+    else:
+        rf_series = risk_free_monthly.reindex(mkt.index).astype(float).ffill().bfill()
 
     mkt_valid = mkt.dropna()
     if mkt_valid.shape[0] < 2:
@@ -492,7 +592,7 @@ def compute_market_equilibrium_returns(
         if debug_beta:
             show = insufficient_tickers[: max(1, int(debug_beta_max))]
             print(f"{debug_tag} tickers (first {len(show)}): {show}")
-    mkt_rp = float((mkt_valid - rf).mean())
+    mkt_rp = float((mkt_valid - rf_series.loc[mkt_valid.index]).mean())
     pi = (betas.fillna(0.0) * mkt_rp).to_numpy(dtype=float)
     return list(returns_df.columns), pi
 
@@ -506,7 +606,7 @@ def process_period_for_model(
     tau: float,
     dataset_df: pd.DataFrame,
     responses_dir: str,
-    risk_free_rate_annual: float = 0.02,
+    rf_monthly_annual: pd.Series,
     min_tickers: int = 25,
     debug_beta: bool = False,
     debug_beta_max: int = 10,
@@ -554,10 +654,13 @@ def process_period_for_model(
             pass
         returns_df = returns_df[common_cols].copy()
 
+    # Align dynamic risk-free to the monthly returns index (convert annual yield -> monthly rate)
+    rf_monthly = align_monthly_rf_to_returns_index(rf_monthly_annual, returns_df.index)
+
     tickers_all, pi = compute_market_equilibrium_returns(
         returns_df=returns_df,
         market_caps=market_caps,
-        risk_free_rate_annual=risk_free_rate_annual,
+        risk_free_monthly=rf_monthly,
         debug_tag=f"[{model_name}] {start_date}->{end_date}",
         debug_beta=debug_beta,
         debug_beta_max=debug_beta_max,
@@ -596,7 +699,7 @@ def main():
     parser.add_argument("--dataset_csv", type=str, default="data/filtered_sp500_data.csv")
     parser.add_argument("--results_dir", type=str, default="results")
 
-    parser.add_argument("--risk_free_rate", type=float, default=0.02)
+    parser.add_argument("--risk_free_csv", type=str, default="data/DGS1.csv", help="CSV with risk-free yield series (e.g., FRED DGS1 export).")
     parser.add_argument("--min_tickers", type=int, default=25)
 
     parser.add_argument("--fail_fast", action="store_true", help="Stop on first error.")
@@ -613,6 +716,12 @@ def main():
 
     # Load filtered_sp500_data.csv once (we use it for both returns and market caps)
     dataset_df = prepare_dataset(args.dataset_csv)
+    # Load dynamic risk-free series (monthly annualized yield in decimal)
+    try:
+        rf_monthly_annual = load_risk_free_monthly_annual(args.risk_free_csv)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load risk-free CSV '{args.risk_free_csv}': {e}")
+
 
     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
     periods = month_pairs(args.start, args.end)
@@ -631,7 +740,7 @@ def main():
                     tau=float(args.tau),
                     dataset_df=dataset_df,
                     responses_dir=args.responses_dir,
-                    risk_free_rate_annual=float(args.risk_free_rate),
+                    rf_monthly_annual=rf_monthly_annual,
                     min_tickers=int(args.min_tickers),
                     debug_beta=bool(args.debug_beta),
                     debug_beta_max=int(args.debug_beta_max),

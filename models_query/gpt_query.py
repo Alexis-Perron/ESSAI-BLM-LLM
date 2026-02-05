@@ -72,6 +72,14 @@ def _validate_expected_return(payload: dict[str, Any]) -> float:
     if not np.isfinite(xf):
         raise ValueError(f"'expected_return' is not finite: {xf}")
 
+    # Heuristic normalization: if model returns percent (e.g., 2 for 2%), convert to decimal.
+    if abs(xf) > 1.0 and abs(xf) <= 100.0:
+        xf = xf / 100.0
+
+    # Guardrails for monthly returns (S&P 500 universe)
+    if abs(xf) > 1.0:
+        raise ValueError(f"'expected_return' out of plausible monthly range: {xf}")
+
     return xf
 
 
