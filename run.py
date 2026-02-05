@@ -67,7 +67,7 @@ def make_system_prompt() -> str:
         "You are a model designed to predict stock returns. "
         "Given a time-series of PAST MONTHLY returns (decimal returns, e.g. 0.02 = +2%), "
         "company metadata, and optionally a recent summarized filing payload (summary_json), "
-        "predict the expected MONTHLY return (decimal) for the NEXT month. "
+        "predict the expected MONTHLY return (decimal) for the NEXT month using only the provided data."
         "If you would output a percent (e.g., 2 for 2%), convert it to decimal (0.02). "
         "Expected return should be a decimal in the range [-1, 1]. "
         'Return ONLY valid JSON that matches this schema: {"expected_return": number}. '
@@ -99,13 +99,9 @@ def make_user_prompt(ticker: str, row: dict) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     # Model selector
-    # Examples:
-    #   --model_name gpt    (OpenAI; uses --openai_model)
-    #   --model_name gemma3 (Ollama; uses local Gemma3)
-    #   --model_name qwen   (Ollama; uses qwen2.5:1.5b)
-    parser.add_argument("--model_name", type=str, default="gpt")
+    parser.add_argument("--models", type=str, default="gpt")
 
-    # Ollama host (only used for local models like gemma3/qwen)
+    # Ollama host (only used for local models like gemma3/qwen/llama)
     parser.add_argument(
         "--ollama_host",
         type=str,
@@ -121,7 +117,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    model_name = str(args.model_name).strip().lower()
+    model_name = str(args.models).strip().lower()
 
     model_id = MODEL_MAP[model_name]
 
@@ -196,22 +192,13 @@ def main() -> None:
     # Load data
     sp500_table = pd.read_csv(args.input_csv, low_memory=False)
 
-    required_cols = {"date", "year", "month", "tic", "stock_ret"}
-    missing = required_cols - set(sp500_table.columns)
-    if missing:
-        raise ValueError(f"Missing required columns in {args.input_csv}: {sorted(missing)}")
-
     # Robust types
     sp500_table["year"] = pd.to_numeric(sp500_table["year"], errors="coerce").astype("Int64")
     sp500_table["month"] = pd.to_numeric(sp500_table["month"], errors="coerce").astype("Int64")
     sp500_table["stock_ret"] = pd.to_numeric(sp500_table["stock_ret"], errors="coerce")
 
-    # Decision date: use char_date when available (info month), else fall back to date.
-    use_char_date = "char_date" in sp500_table.columns
-    if use_char_date:
-        sp500_table["decision_date"] = parse_yyyymmdd_int_to_datetime(sp500_table["char_date"])
-    else:
-        sp500_table["decision_date"] = parse_yyyymmdd_int_to_datetime(sp500_table["date"])
+
+    sp500_table["decision_date"] = parse_yyyymmdd_int_to_datetime(sp500_table["char_date"])
 
     sp500_table = sp500_table.dropna(subset=["decision_date", "tic"]).copy()
 
@@ -220,22 +207,9 @@ def main() -> None:
 
     sp500_table["tic"] = normalize_ticker_series(sp500_table["tic"])
 
-    # If we are using char_date as decision month, stock_ret is t+1 by construction.
     # Shift by 1 month per ticker so past_returns are strictly <= decision month.
-    if use_char_date:
-        sp500_table = sp500_table.sort_values(["tic", "ym", "decision_date"])
-        sp500_table["realized_ret"] = sp500_table.groupby("tic")["stock_ret"].shift(1)
-    else:
-        sp500_table["realized_ret"] = sp500_table["stock_ret"]
-
-    # Optional metadata columns
-    company_col = "conm" if "conm" in sp500_table.columns else None
-    sector_name_col = "gics_sector_name" if "gics_sector_name" in sp500_table.columns else None
-    gics_col = "gics" if "gics" in sp500_table.columns else None
-    sic_col = "sic" if "sic" in sp500_table.columns else None
-    naics_col = "naics" if "naics" in sp500_table.columns else None
-    market_equity_col = "market_equity" if "market_equity" in sp500_table.columns else None
-    summary_json_col = "summary_json" if "summary_json" in sp500_table.columns else None
+    sp500_table = sp500_table.sort_values(["tic", "ym", "decision_date"])
+    sp500_table["realized_ret"] = sp500_table.groupby("tic")["stock_ret"].shift(1)
 
     # Iterate months
     start_dt = pd.to_datetime(args.start)
@@ -283,19 +257,19 @@ def main() -> None:
             last = g.iloc[-1]
             past_returns = hist_map.get(tic, [])
 
-            summary_json_val = last[summary_json_col] if summary_json_col else ""
+            summary_json_val = last["summary_json"]
             if pd.isna(summary_json_val):
                 summary_json_val = ""
             else:
                 summary_json_val = str(summary_json_val)
 
             row = {
-                "company_name": last[company_col] if company_col else "",
-                "gics_sector_name": last[sector_name_col] if sector_name_col else "",
-                "gics": last[gics_col] if gics_col else "",
-                "sic": last[sic_col] if sic_col else "",
-                "naics": last[naics_col] if naics_col else "",
-                "market_equity": float(last[market_equity_col]) if market_equity_col else "",
+                "company_name": last["conm"],
+                "gics_sector_name": last["gics_sector_name"],
+                "gics": last["gics"],
+                "sic": last["sic"],
+                "naics": last["naics"],
+                "market_equity": float(last["market_equity"]),
                 "past_returns": [float(x) for x in past_returns if pd.notna(x)],
                 "summary_json": summary_json_val,
             }

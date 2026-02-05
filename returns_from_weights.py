@@ -67,7 +67,6 @@ def _clean_ticker(x: str) -> str:
 def _normalize_weights_columns(
     weights_df: pd.DataFrame,
     date_col: str,
-    verbose: bool = False,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     Rename / aggregate asset columns in weights_df using _clean_ticker.
@@ -99,9 +98,6 @@ def _normalize_weights_columns(
     new_df = pd.concat([weights_df[[date_col]].copy()] + cols_series, axis=1)
 
     cleaned_assets = list(mapping.keys())
-    if verbose:
-        dropped = len(raw_assets) - sum(len(v) for v in mapping.values())
-        print(f"[normalize] weights: {len(raw_assets)} raw asset cols -> {len(cleaned_assets)} cleaned cols (dropped {dropped})")
     return new_df, cleaned_assets
 
 
@@ -151,8 +147,6 @@ def calculate_model_returns(
     weights_path: Optional[str] = None,
     out_path: Optional[str] = None,
     apply_next_month: bool = True,
-    strict: bool = False,
-    verbose: bool = True,
 ) -> Optional[pd.DataFrame]:
     """
     Compute portfolio returns for a model from BL weights + realized returns,
@@ -191,11 +185,6 @@ def calculate_model_returns(
 
     weights_file = next((c for c in candidates if c.exists()), None)
     if weights_file is None:
-        msg = f"[{model}] Missing weights file. Tried: " + ", ".join(str(c) for c in candidates)
-        if strict:
-            raise FileNotFoundError(msg)
-        if verbose:
-            print(msg, "-> SKIP model")
         return None
 
     weights_df = pd.read_csv(weights_file)
@@ -208,7 +197,7 @@ def calculate_model_returns(
     # Normalize weights dates to month-start
     weights_df['Date'] = weights_df['Date'].dt.to_period("M").dt.to_timestamp()
     # Normalize / aggregate asset columns by cleaned ticker
-    weights_df, asset_columns = _normalize_weights_columns(weights_df, date_col="Date", verbose=False)
+    weights_df, asset_columns = _normalize_weights_columns(weights_df, date_col="Date")
 
     # Load dataset once
     ds = pd.read_csv(dataset_path)
@@ -243,10 +232,6 @@ def calculate_model_returns(
 
         if target_ym not in month_groups:
             msg = f"[{model}] No data in dataset for target month {target_ym}."
-            if strict:
-                raise ValueError(msg)
-            if verbose:
-                print(msg, "-> SKIP month", str(weight_date.date()))
             continue
 
         month_df = month_groups[target_ym]
@@ -259,20 +244,12 @@ def calculate_model_returns(
 
         if r_series.empty or not np.isfinite(r_series.to_numpy(dtype=float)).any():
             msg = f"[{model}] No valid numeric returns in dataset for target month {target_ym}."
-            if strict:
-                raise ValueError(msg)
-            if verbose:
-                print(msg, "-> SKIP month", str(weight_date.date()))
             continue
 
         # Select weights row for weight month
         row = weights_df.loc[weights_df['Date'] == weight_date]
         if row.empty:
             msg = f"[{model}] No weights found for {weight_date.date()} in {weights_file.name}"
-            if strict:
-                raise ValueError(msg)
-            if verbose:
-                print(msg, "-> SKIP month")
             continue
 
         w = row[asset_columns].iloc[0].to_numpy(dtype=float)
@@ -284,10 +261,6 @@ def calculate_model_returns(
 
         if not finite.any():
             msg = f"[{model}] No finite returns for target month {target_ym} after alignment."
-            if strict:
-                raise ValueError(msg)
-            if verbose:
-                print(msg, "-> SKIP month", str(weight_date.date()))
             continue
 
         # Use only assets with finite returns
@@ -309,9 +282,6 @@ def calculate_model_returns(
             else:
                 denom = float(len(w_f))
                 w_use = np.ones_like(w_f, dtype=float)
-            if verbose:
-                print(f"[{model}] Warning: weights not investable for {weight_date.date()} (sum≈0). "
-                      f"Using fallback normalization for target {target_ym}.")
         else:
             w_use = w_f
 
@@ -325,18 +295,11 @@ def calculate_model_returns(
         )
 
     if not out_rows:
-        msg = f"[{model}] No returns computed for the requested period."
-        if strict:
-            raise ValueError(msg)
-        if verbose:
-            print(msg)
         return None
 
     out = pd.DataFrame(out_rows).sort_values("date_key").reset_index(drop=True)
     out.to_csv(out_path, index=False)
 
-    if verbose:
-        print(f"[{model}] Saved: {out_path} (rows={len(out)})")
     return out
 
 
@@ -353,7 +316,6 @@ def main() -> None:
     parser.add_argument("--results_dir", type=str, default="results")
     parser.add_argument("--apply_next_month", action="store_true", help="Apply weights at month M to returns of month M+1.")
     parser.add_argument("--no_apply_next_month", action="store_true", help="Apply weights at month M to returns of month M.")
-    parser.add_argument("--strict", action="store_true")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
@@ -364,7 +326,6 @@ def main() -> None:
     elif args.apply_next_month:
         apply_next_month = True
 
-    verbose = not args.quiet
 
     for m in args.models:
         calculate_model_returns(
@@ -375,8 +336,6 @@ def main() -> None:
             dataset_path=args.dataset_path,
             results_dir=args.results_dir,
             apply_next_month=apply_next_month,
-            strict=args.strict,
-            verbose=verbose,
         )
 
 

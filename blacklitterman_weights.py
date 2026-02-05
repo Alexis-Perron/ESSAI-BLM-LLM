@@ -30,18 +30,15 @@ def _parse_yyyymmdd_int(x):
     filtered_sp500_data.csv often has 'date' like 20210129 (int).
 
     """
-    if pd.isna(x):
-        return pd.NaT
     try:
         xi = int(x)
         s = str(xi)
     except Exception:
         s = str(x)
     s_digits = "".join(ch for ch in s if ch.isdigit())
-    if len(s_digits) >= 8:
-        s_digits = s_digits[:8]
-        return pd.to_datetime(s_digits, format="%Y%m%d", errors="coerce")
-    return pd.to_datetime(s, errors="coerce")
+    s_digits = s_digits[:8]
+    
+    return pd.to_datetime(s_digits, format="%Y%m%d", errors="coerce")
 
 def month_pairs(start: str, end: str) -> List[Tuple[str, str]]:
     """Return list of (month_start, month_end) covering [start, end]."""
@@ -525,8 +522,6 @@ def compute_market_equilibrium_returns(
     market_caps: Dict[str, float],
     risk_free_monthly: pd.Series | None = None,
     debug_tag: str = "",
-    debug_beta: bool = False,
-    debug_beta_max: int = 10,
 ) -> Tuple[List[str], np.ndarray]:
     """
     CAPM-like equilibrium:
@@ -589,9 +584,6 @@ def compute_market_equilibrium_returns(
         print(
             f"{debug_tag} beta: insufficient data for {len(insufficient_tickers)} tickers -> betas set to 0."
         )
-        if debug_beta:
-            show = insufficient_tickers[: max(1, int(debug_beta_max))]
-            print(f"{debug_tag} tickers (first {len(show)}): {show}")
     mkt_rp = float((mkt_valid - rf_series.loc[mkt_valid.index]).mean())
     pi = (betas.fillna(0.0) * mkt_rp).to_numpy(dtype=float)
     return list(returns_df.columns), pi
@@ -608,8 +600,6 @@ def process_period_for_model(
     responses_dir: str,
     rf_monthly_annual: pd.Series,
     min_tickers: int = 25,
-    debug_beta: bool = False,
-    debug_beta_max: int = 10,
 ) -> pd.Series:
     """
     For a given period and model:
@@ -662,8 +652,6 @@ def process_period_for_model(
         market_caps=market_caps,
         risk_free_monthly=rf_monthly,
         debug_tag=f"[{model_name}] {start_date}->{end_date}",
-        debug_beta=debug_beta,
-        debug_beta_max=debug_beta_max,
     )
 
     if str(model_name).strip().lower() in {"none", "null"}:
@@ -702,16 +690,6 @@ def main():
     parser.add_argument("--risk_free_csv", type=str, default="data/DGS1.csv", help="CSV with risk-free yield series (e.g., FRED DGS1 export).")
     parser.add_argument("--min_tickers", type=int, default=25)
 
-    parser.add_argument("--fail_fast", action="store_true", help="Stop on first error.")
-
-    # NEW: debug betas
-    parser.add_argument(
-        "--debug_beta",
-        action="store_true",
-        help="Print tickers with insufficient data when computing betas.",
-    )
-    parser.add_argument("--debug_beta_max", type=int, default=10, help="How many tickers to print when debug_beta is on.")
-
     args = parser.parse_args()
 
     # Load filtered_sp500_data.csv once (we use it for both returns and market caps)
@@ -742,14 +720,10 @@ def main():
                     responses_dir=args.responses_dir,
                     rf_monthly_annual=rf_monthly_annual,
                     min_tickers=int(args.min_tickers),
-                    debug_beta=bool(args.debug_beta),
-                    debug_beta_max=int(args.debug_beta_max),
                 )
                 results[(start_date, end_date)] = w
             except Exception as e:
                 msg = f"[{model}] Error period {start_date} -> {end_date}: {e}"
-                if args.fail_fast:
-                    raise
                 print(msg)
 
         if not results:
