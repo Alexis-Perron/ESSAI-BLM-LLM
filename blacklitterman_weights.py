@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 from tqdm import tqdm
 
 LOOKBACK_MONTHS = 60  # trailing months used to estimate cov/betas (including current month)
-MIN_RET_ROWS = 2        # minimum months required to run estimation
+MIN_RET_ROWS = 2      # minimum months required to run estimation
 
 # View calibration guardrails
 OMEGA_FLOOR = 1e-4
@@ -282,21 +282,18 @@ def load_risk_free_monthly_annual(rf_csv_path: str) -> pd.Series:
     """
     df = pd.read_csv(rf_csv_path)
     # Robustly identify columns
-    date_col = "DATE" if "DATE" in df.columns else df.columns[0]
-    val_cols = [c for c in df.columns if c != date_col]
-    if not val_cols:
-        raise ValueError(f"Risk-free CSV has no value column besides '{date_col}'.")
+    val_cols = [c for c in df.columns if c != 'observation_date']
     val_col = val_cols[0]
 
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df['observation_date'] = pd.to_datetime(df['observation_date'], errors="coerce")
     df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
 
-    df = df.dropna(subset=[date_col, val_col]).sort_values(date_col)
+    df = df.dropna(subset=['observation_date', val_col]).sort_values('observation_date')
     if df.empty:
         raise ValueError("Risk-free CSV contains no valid (date, value) rows.")
 
     # Convert percent -> decimal
-    s = df.set_index(date_col)[val_col].astype(float) / 100.0
+    s = df.set_index('observation_date')[val_col].astype(float) / 100.0
 
     # Month-end (annualized) yield, last observation in month
     s_m = s.resample("M").last()
@@ -695,11 +692,7 @@ def main():
     # Load filtered_sp500_data.csv once (we use it for both returns and market caps)
     dataset_df = prepare_dataset(args.dataset_csv)
     # Load dynamic risk-free series (monthly annualized yield in decimal)
-    try:
-        rf_monthly_annual = load_risk_free_monthly_annual(args.risk_free_csv)
-    except Exception as e:
-        raise RuntimeError(f"Failed to load risk-free CSV '{args.risk_free_csv}': {e}")
-
+    rf_monthly_annual = load_risk_free_monthly_annual(args.risk_free_csv)
 
     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
     periods = month_pairs(args.start, args.end)

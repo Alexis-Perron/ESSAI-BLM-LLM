@@ -164,7 +164,6 @@ def calculate_model_returns(
     """
     model_raw = model_name.strip()
     model = model_raw.lower()
-    model_is_none = model in {"none", "null"}
 
     if weights_path is None:
         weights_path = str(Path(results_dir) / f"{model}_black_litterman_weights_tau_{tau}.csv")
@@ -177,11 +176,6 @@ def calculate_model_returns(
     candidates = [Path(weights_path)]
     if model_raw and model_raw.lower() != model_raw:
         candidates.append(Path(results_dir) / f"{model_raw}_black_litterman_weights_tau_{tau}.csv")
-    if model_is_none:
-        candidates.extend([
-            Path(results_dir) / f"None_black_litterman_weights_tau_{tau}.csv",
-            Path(results_dir) / f"none_black_litterman_weights_tau_{tau}.csv",
-        ])
 
     weights_file = next((c for c in candidates if c.exists()), None)
     if weights_file is None:
@@ -308,7 +302,7 @@ def calculate_model_returns(
 # -------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute portfolio returns from BL weights + dataset returns.")
-    parser.add_argument("--models", nargs="+", required=True, help="List of model names (e.g., gpt gemma3 None).")
+    parser.add_argument("--models", nargs="+", required=True, help="List of model names (e.g., gpt gemma3).")
     parser.add_argument("--tau", type=float, default=0.025)
     parser.add_argument("--start_date", type=str, default="2015-01-01")
     parser.add_argument("--end_date", type=str, default="2025-06-30")
