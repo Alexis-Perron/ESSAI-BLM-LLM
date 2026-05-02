@@ -48,305 +48,29 @@ and keys.py containing gpt_key
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import random
-import sys
-import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 from openai import OpenAI
-from pydantic import BaseModel, Field
 from tqdm import tqdm
 
 from keys import gpt_key
 
 
-# -----------------------------
-# Compatibility for some pickles
-# -----------------------------
-def _ensure_numpy_core_alias() -> None:
-    """
-    Some pickles reference numpy._core (NumPy 2.x layout). If running NumPy 1.x,
-    create aliases so unpickling works.
-    """
-    try:
-        import numpy.core as npcore  # noqa
-        sys.modules.setdefault("numpy._core", npcore)
-        try:
-            import numpy.core._multiarray_umath as mau  # noqa
-            sys.modules.setdefault("numpy._core._multiarray_umath", mau)
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-# -----------------------------
-# Structured output schema
-# -----------------------------
-class StructuredSummary(BaseModel):
-    summary: str = Field(..., description="150-200 word factual summary of the most material points.")
-    bullish_points: list[str] = Field(..., description="2-5 short bullets (<= 18 words) that could be positive for returns.")
-    bearish_points: list[str] = Field(..., description="2-5 short bullets (<= 18 words) that could be negative for returns.")
-    guidance_change: str = Field(..., description="One of: up, down, none, unknown")
-    risk_level: int = Field(..., ge=1, le=5, description="1 (low) to 5 (high) risk based on disclosed risks.")
-
-
-def _normalize_whitespace(s: str) -> str:
-    return s.replace("\r\n", "\n").replace("\r", "\n").strip()
-
-
-def _trim_text(x: Any, max_chars: int, trim_mode: str = "headtail") -> str:
-    """
-    Trim large text to control token usage.
-
-    trim_mode:
-      - "head": keep first max_chars
-      - "headtail": keep first half + last half (better context)
-    """
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    s = _normalize_whitespace(str(x))
-    if not max_chars or max_chars <= 0 or len(s) <= max_chars:
-        return s
-
-    if trim_mode.lower() == "head":
-        return s[:max_chars] + "\n...[TRUNCATED]..."
-
-    # headtail
-    half = max_chars // 2
-    head = s[:half]
-    tail = s[-(max_chars - half):]
-    return head + "\n...[MIDDLE TRUNCATED]...\n" + tail
-
-
-def _system_prompt() -> str:
-    return (
-        "You are a careful financial analyst.\n"
-        "Summarize SEC filing text sections into a compact, structured form.\n"
-        "Rules:\n"
-        "- Use ONLY the content provided.\n"
-        "- Be concise, factual, and avoid speculation.\n"
-        "- Keep concrete numbers if explicitly stated (revenue, margins, guidance, debt, cash flows).\n"
-        "- If a section is empty, do not invent details.\n"
-        "- guidance_change must be exactly one of: up, down, none, unknown.\n"
-        "- risk_level must be an integer 1-5.\n"
-        "Return ONLY JSON matching the schema."
-    )
-
-
-def _user_prompt(*, date: Any, gvkey: Any, file_type: Any, mgmt: str, rf: str) -> str:
-    return (
-        f"Metadata:\n"
-        f"- date: {date}\n"
-        f"- gvkey: {gvkey}\n"
-        f"- file_type: {file_type}\n\n"
-        "Section: Management Discussion & Analysis (mgmt)\n"
-        "-----\n"
-        f"{mgmt}\n"
-        "-----\n\n"
-        "Section: Risk Factors (rf)\n"
-        "-----\n"
-        f"{rf}\n"
-        "-----\n\n"
-        "Produce JSON:\n"
-        "- summary: 150-200 words\n"
-        "- bullish_points: 2-5 bullets\n"
-        "- bearish_points: 2-5 bullets\n"
-        "- guidance_change: up/down/none/unknown\n"
-        "- risk_level: 1-5\n"
-    )
-
-
-# -----------------------------
-# Retry / backoff
-# -----------------------------
-@dataclass
-class RetryConfig:
-    max_retries: int = 8
-    base_sleep: float = 1.0
-    max_sleep: float = 30.0
-
-
-def _sleep_backoff(attempt: int, cfg: RetryConfig) -> None:
-    delay = min(cfg.max_sleep, cfg.base_sleep * (2 ** attempt))
-    delay *= random.uniform(0.7, 1.3)
-    time.sleep(delay)
-
-
-def _call_openai_summary(
-    client: OpenAI,
-    model: str,
-    temperature: float,
-    date: Any,
-    gvkey: Any,
-    file_type: Any,
-    mgmt_text: str,
-    rf_text: str,
-    retry_cfg: RetryConfig,
-) -> StructuredSummary:
-    instructions = _system_prompt()
-    prompt = _user_prompt(date=date, gvkey=gvkey, file_type=file_type, mgmt=mgmt_text, rf=rf_text)
-
-    last_err: Optional[Exception] = None
-    for attempt in range(retry_cfg.max_retries + 1):
-        try:
-            resp = client.responses.parse(
-                model=model,
-                instructions=instructions,
-                input=prompt,
-                text_format=StructuredSummary,
-                temperature=temperature,
-            )
-            return resp.output_parsed
-        except Exception as e:
-            last_err = e
-            if attempt >= retry_cfg.max_retries:
-                break
-            _sleep_backoff(attempt, retry_cfg)
-
-    raise RuntimeError(f"OpenAI call failed after retries: {last_err}") from last_err
-
-
-# -----------------------------
-# Caching
-# -----------------------------
-def _hash_payload(mgmt: str, rf: str, file_type: str, schema_version: str) -> str:
-    h = hashlib.sha256()
-    h.update(schema_version.encode("utf-8", errors="ignore"))
-    h.update(b"\n---\n")
-    h.update(str(file_type).encode("utf-8", errors="ignore"))
-    h.update(b"\n---\n")
-    h.update(mgmt.encode("utf-8", errors="ignore"))
-    h.update(b"\n---\n")
-    h.update(rf.encode("utf-8", errors="ignore"))
-    return h.hexdigest()
-
-
-def _load_cache(path: Path) -> dict[str, dict]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_cache(path: Path, cache: dict[str, dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-
-
-def _compact_rf_block(bull: list[str], bear: list[str], guidance: str, risk: int) -> str:
-    out = []
-    if bull:
-        out.append("Bullish points: " + " | ".join(map(str, bull)))
-    if bear:
-        out.append("Bearish points: " + " | ".join(map(str, bear)))
-    out.append(f"Guidance change: {guidance}")
-    out.append(f"Risk level: {risk}/5")
-    return "\n".join(out)
-# -----------------------------
-# S&P 500 filtering via gvkey (data/filtered_sp500_data.csv)
-# -----------------------------
-def _normalize_gvkey(x: Any) -> str:
-    """
-    Normalize gvkey identifiers for matching across datasets.
-
-    The .pkl files often store gvkey as float (e.g., 1234.0). We convert to a
-    clean string key (e.g., "1234").
-    """
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return ""
-    # Try numeric normalization first
-    try:
-        # Handles floats like 1234.0 and strings like "1234.0"
-        xi = int(float(x))
-        return str(xi)
-    except Exception:
-        s = str(x).strip()
-        if s.endswith(".0"):
-            s = s[:-2]
-        return s
-
-
-def _infer_year_series(df: pd.DataFrame, *, year_col: Optional[str] = None, date_col: Optional[str] = None) -> pd.Series:
-    """
-    Infer a year Series from a dataframe using either an explicit year column,
-    or a date-like column whose first 4 digits represent the year.
-    """
-    cols_lower = {c.lower(): c for c in df.columns}
-
-    # Explicit year column
-    if year_col and year_col in df.columns:
-        y = pd.to_numeric(df[year_col], errors="coerce")
-        return y.astype("Int64")
-
-    for cand in ["year", "fyear", "fiscal_year"]:
-        if cand in cols_lower:
-            y = pd.to_numeric(df[cols_lower[cand]], errors="coerce")
-            return y.astype("Int64")
-
-    # Date column
-    if date_col and date_col in df.columns:
-        s = df[date_col]
-    else:
-        for cand in ["date", "datadate", "char_date", "rdq", "adate", "caldt"]:
-            if cand in cols_lower:
-                s = df[cols_lower[cand]]
-                break
-        else:
-            raise ValueError(
-                "Cannot infer year from filtered_sp500_data.csv: no year/date column found. "
-                f"Columns: {list(df.columns)}"
-            )
-
-    # Parse year from common formats
-    s = s.astype(str).str.strip()
-    # If it's like 20050104, year = first 4 chars
-    year = pd.to_numeric(s.str.slice(0, 4), errors="coerce")
-    return year.astype("Int64")
-
-
-def _load_sp500_gvkeys_for_year(
-    year: int,
-    csv_path: Path,
-    *,
-    gvkey_col: Optional[str] = None,
-    year_col: Optional[str] = None,
-    date_col: Optional[str] = None,
-) -> set[str]:
-    """
-    Load the set of gvkeys that are in the S&P 500 (as represented by the
-    data filtered dataset) for the given calendar year.
-    """
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Missing S&P500 gvkey dataset: {csv_path}")
-
-    dfx = pd.read_csv(csv_path)
-
-    cols_lower = {c.lower(): c for c in dfx.columns}
-    if gvkey_col and gvkey_col in dfx.columns:
-        gcol = gvkey_col
-    elif "gvkey" in cols_lower:
-        gcol = cols_lower["gvkey"]
-    else:
-        raise ValueError(
-            "filtered_sp500_data.csv must contain a gvkey column. "
-            f"Columns: {list(dfx.columns)}"
-        )
-
-    years = _infer_year_series(dfx, year_col=year_col, date_col=date_col)
-    mask = years == int(year)
-
-    gv = dfx.loc[mask, gcol].map(_normalize_gvkey)
-    return {x for x in gv.tolist() if x}
-
+from utils import (
+    _compact_rf_block,
+    _ensure_numpy_core_alias,
+    _hash_payload,
+    _load_cache,
+    _load_sp500_gvkeys_for_year,
+    _save_cache,
+    _trim_text,
+    _normalize_gvkey,
+    _call_openai_summary,
+    RetryConfig
+)
 
 
 # -----------------------------
@@ -529,7 +253,7 @@ def main() -> None:
         help="Optional name of the date column (YYYYMMDD/ISO) in --sp500_gvkey_csv to infer year (auto-detected if empty)."
     )
     parser.add_argument("--start_year", type=int, default=2015)
-    parser.add_argument("--end_year", type=int, default=2018)
+    parser.add_argument("--end_year", type=int, default=2016)
 
     parser.add_argument("--model", type=str, default="gpt-4o-mini")
     parser.add_argument("--temperature", type=float, default=0.0)

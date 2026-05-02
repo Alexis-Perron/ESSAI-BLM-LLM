@@ -6,92 +6,15 @@ Supported model_name values:
   - gpt   -> OpenAI via gpt_query.py
   - gemma3 -> Ollama via gemma_query.py
   - qwen  -> Ollama via qwen_query.py
+  - llama -> Ollama via llama_query.py
 
 """
-
+from utils import (json_default, normalize_ticker_series, parse_yyyymmdd_int_to_datetime, make_system_prompt, make_user_prompt, MODEL_MAP)
 import argparse
 import json
 import os
-from pathlib import Path
-import calendar
-
-import numpy as np
 import pandas as pd
 from tqdm import tqdm
-
-MODEL_MAP = {
-    "gemma3": "gemma3",
-    "qwen": "qwen2.5:1.5b",
-    "gpt": "gpt-4o-mini",
-    "llama": "llama3.2",
-}
-
-# -------------------------
-# Utils
-# -------------------------
-def json_default(o):
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        return float(o)
-    if isinstance(o, (np.ndarray,)):
-        return o.tolist()
-    return str(o)
-
-
-def normalize_ticker_series(s: pd.Series) -> pd.Series:
-    s = s.astype(str).str.strip().str.upper()
-    s = s.str.replace(r"\s+", "", regex=True)
-    s = s.str.replace("-", ".", regex=False)
-    return s
-
-
-def parse_yyyymmdd_int_to_datetime(s: pd.Series) -> pd.Series:
-    """
-    This function was written by ChatGPT 5.2
-    Robust parse for YYYYMMDD stored as int/float/str.
-    """
-    ss = s.astype("Int64").astype(str).str.replace(r"\D+", "", regex=True).str.slice(0, 8)
-    return pd.to_datetime(ss, format="%Y%m%d", errors="coerce")
-
-
-def get_last_day_of_month(year: int, month: int) -> int:
-    return calendar.monthrange(year, month)[1]
-
-
-# -------------------------
-# Prompts
-# -------------------------
-def make_system_prompt() -> str:
-    return (
-        "You are a model designed to predict stock returns. "
-        "Given a time-series of PAST MONTHLY returns (decimal returns, e.g. 0.02 = +2%), "
-        "company metadata, and optionally a recent summarized filing payload (summary_json), "
-        "predict the expected MONTHLY return (decimal) for the NEXT month using only the provided data."
-        "If you would output a percent (e.g., 2 for 2%), convert it to decimal (0.02). "
-        "Expected return should be a decimal in the range [-1, 1]. "
-        'Return ONLY valid JSON that matches this schema: {"expected_return": number}. '
-        "Do not include any extra keys or text."
-    )
-
-
-def make_user_prompt(ticker: str, row: dict) -> str:
-    filing_json = row.get("summary_json", "")
-    filing_json = "" if filing_json is None else str(filing_json)
-    filing_json = "" if filing_json.strip().lower() in {"nan", "none"} else filing_json
-
-    return (
-        f"Ticker: {ticker}\n"
-        f"Company: {row.get('company_name', '')}\n"
-        f"Sector (GICS): {row.get('gics_sector_name', '')}\n"
-        f"GICS code: {row.get('gics', '')}\n"
-        f"SIC: {row.get('sic', '')}\n"
-        f"NAICS: {row.get('naics', '')}\n"
-        f"Market equity: {row.get('market_equity', '')}\n"
-        f"past_monthly_returns: {row.get('past_returns', [])}\n"
-        f"summary_json: {filing_json}"
-    )
-
 
 # -------------------------
 # Main
@@ -207,7 +130,7 @@ def main() -> None:
 
     sp500_table["tic"] = normalize_ticker_series(sp500_table["tic"])
 
-    # Shift by 1 month per ticker so past_returns are strictly <= decision month.
+    # Shift by 1 month per ticker so past_returns are strictly < decision month.
     sp500_table = sp500_table.sort_values(["tic", "ym", "decision_date"])
     sp500_table["realized_ret"] = sp500_table.groupby("tic")["stock_ret"].shift(1)
 

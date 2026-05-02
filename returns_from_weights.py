@@ -1,138 +1,16 @@
 import argparse
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
-
+from typing import Optional
 import numpy as np
 import pandas as pd
-import re
 
-
-def _month_starts_between(start_date: str, end_date: str) -> pd.DatetimeIndex:
-    """Return month-start timestamps between start_date and end_date inclusive."""
-    s = pd.to_datetime(start_date)
-    e = pd.to_datetime(end_date)
-    return pd.date_range(start=s, end=e, freq="MS")
-
-
-def _parse_dataset_dates(s: pd.Series) -> pd.Series:
-    """
-    Robustly parse dates from the dataset.
-
-    Handles common formats:
-      - int/float like 20141230 interpreted as YYYYMMDD
-      - strings like '2014-12-30' or '20141230'
-      - already-datetime values
-
-    Returns datetime64[ns] with NaT for unparsable values.
-    """
-    if pd.api.types.is_numeric_dtype(s):
-        v = pd.to_numeric(s, errors="coerce")
-        if np.isfinite(v).any():
-            v_nonnull = v[np.isfinite(v)]
-            if len(v_nonnull) and (np.nanmedian(v_nonnull) > 1_000_000):  # ~YYYYMMDD
-                ss = v.astype("Int64").astype(str).str.zfill(8)
-                return pd.to_datetime(ss, format="%Y%m%d", errors="coerce")
-        return pd.to_datetime(v, errors="coerce")
-
-    ss = s.astype(str).str.strip()
-    looks_yyyymmdd = ss.str.match(r"^\d{8}$")
-    out = pd.Series(pd.NaT, index=s.index)
-
-    if looks_yyyymmdd.any():
-        out.loc[looks_yyyymmdd] = pd.to_datetime(ss.loc[looks_yyyymmdd], format="%Y%m%d", errors="coerce")
-    out.loc[~looks_yyyymmdd] = pd.to_datetime(ss.loc[~looks_yyyymmdd], errors="coerce")
-    return out
-
-
-def _clean_ticker(x: str) -> str:
-    """
-    Normalize tickers so weights columns and dataset tickers align.
-    - strip whitespace
-    - uppercase
-    - convert '-' -> '.' (e.g., BRK-B -> BRK.B)
-    - drop surrounding quotes
-    """
-    if x is None:
-        return ""
-    s = str(x).strip().strip('"').strip("'").upper()
-    if not s or s in {"NAN", "NONE"}:
-        return ""
-    if "-" in s and "." not in s:
-        s = s.replace("-", ".")
-    # Collapse multiple spaces
-    s = re.sub(r"\s+", "", s)
-    return s
-
-
-def _normalize_weights_columns(
-    weights_df: pd.DataFrame,
-    date_col: str,
-) -> Tuple[pd.DataFrame, List[str]]:
-    """
-    Rename / aggregate asset columns in weights_df using _clean_ticker.
-
-    If multiple original columns map to the same cleaned ticker, we sum them.
-    Returns (new_weights_df, cleaned_asset_columns).
-    """
-    raw_assets = [c for c in weights_df.columns if c != date_col]
-    mapping: Dict[str, List[str]] = {}
-    for c in raw_assets:
-        cc = _clean_ticker(c)
-        if not cc:
-            continue
-        mapping.setdefault(cc, []).append(c)
-
-    if not mapping:
-        raise ValueError("No usable asset columns found after ticker normalization.")
-
-    cols_series: List[pd.Series] = []
-    for cc, cols in mapping.items():
-        if len(cols) == 1:
-            s = pd.to_numeric(weights_df[cols[0]], errors="coerce")
-        else:
-            # Sum duplicates (e.g., multiple share-class spellings)
-            s = pd.to_numeric(weights_df[cols], errors="coerce").sum(axis=1, min_count=1)
-        cols_series.append(s.rename(cc))
-
-    # Build all columns at once to avoid DataFrame fragmentation warnings / slow inserts
-    new_df = pd.concat([weights_df[[date_col]].copy()] + cols_series, axis=1)
-
-    cleaned_assets = list(mapping.keys())
-    return new_df, cleaned_assets
-
-
-def _get_monthly_returns_series(
-    month_df: pd.DataFrame,
-    ticker_col: str,
-    date_col: str,
-    ret_col: str,
-) -> Tuple[pd.Series, pd.Timestamp]:
-    """
-    From a slice of the dataset for ONE month, return:
-      - Series indexed by *cleaned* ticker with that month's return (float)
-      - month_end_date: max date observed in that month slice
-
-    We use the last available observation per (month, ticker) to represent that month's return.
-    """
-    if month_df.empty:
-        return pd.Series(dtype=float), pd.NaT
-
-    month_df = month_df.sort_values(date_col)
-
-    last_obs = (
-        month_df.groupby(ticker_col, observed=True, sort=False)
-        .tail(1)
-        [[ticker_col, ret_col, date_col]]
-    )
-
-    r = pd.to_numeric(last_obs[ret_col], errors="coerce").to_numpy()
-    t = last_obs[ticker_col].astype(str).map(_clean_ticker).to_numpy()
-    out = pd.Series(r, index=t, dtype=float)
-    out = out[~out.index.duplicated(keep="last")]
-
-    month_end_date = pd.to_datetime(last_obs[date_col], errors="coerce").max()
-    return out, month_end_date
-
+from utils import (
+    _clean_ticker,
+    _month_starts_between,
+    _normalize_weights_columns,
+    _parse_dataset_dates,
+    _get_monthly_returns_series,
+)
 
 # -------------------------
 # Core computation
