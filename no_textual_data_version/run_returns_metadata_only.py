@@ -1,0 +1,297 @@
+"""run_returns_metadata_only.py
+
+Run monthly inference of expected returns using an LLM, but WITHOUT sending
+`summary_json` or any filing-text summary to the model.
+
+Inputs sent to the LLM for each ticker/month:
+  - company metadata
+  - market equity
+  - trailing past monthly returns
+
+Outputs are saved separately from the original pipeline:
+  - default directory: responses_returns_metadata_only/
+  - default filename pattern:
+      {model}_returns_metadata_only_{YYYY-MM-DD}_{YYYY-MM-DD}.json
+
+Supported model_name values:
+  - gpt    -> OpenAI via models_query/gpt_query.py
+  - gemma3 -> Ollama via models_query/gemma_query.py
+  - qwen   -> Ollama via models_query/qwen_query.py
+  - llama  -> Ollama via models_query/llama_query.py
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+from tqdm import tqdm
+
+from utils_returns_metadata_only import (
+    MODEL_MAP,
+    json_default,
+    make_system_prompt_returns_metadata_only,
+    make_user_prompt_returns_metadata_only,
+    normalize_ticker_series,
+    parse_yyyymmdd_int_to_datetime,
+)
+
+
+# -------------------------
+# LLM client factory
+# -------------------------
+def build_llm_client(model_name: str, model_id: str, ollama_host: str):
+    """Build the same LLM clients as the original pipeline.
+
+    The primary imports assume the project structure uses `models_query/`.
+    The fallback imports make the script easier to test when the query files are
+    located directly beside this script.
+    """
+    if model_name == "gpt":
+        try:
+            from pathlib import Path
+            import sys
+            PARENT_DIR = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(PARENT_DIR))
+            from keys import gpt_key
+            
+        except Exception as e:
+            raise RuntimeError("Can't import gpt_key from keys.py.") from e
+
+        try:
+            from pathlib import Path
+            import sys
+            PARENT_DIR = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(PARENT_DIR))
+
+            from models_query.gpt_query import GPTQuery
+
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer GPTQuery. Fais: pip install openai") from e
+
+        return GPTQuery(
+            api_key=gpt_key,
+            model=model_id,
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+    if model_name == "qwen":
+        try:
+            from pathlib import Path
+            import sys
+            PARENT_DIR = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(PARENT_DIR))
+            from models_query.qwen_query import QwenQuery
+
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer QwenQuery.") from e
+
+        return QwenQuery(
+            model=model_id,
+            host=str(ollama_host),
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+    if model_name == "gemma3":
+        try:
+            from pathlib import Path
+            import sys
+            PARENT_DIR = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(PARENT_DIR))
+            from models_query.gemma_query import GemmaQuery
+
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer GemmaQuery.") from e
+
+        return GemmaQuery(
+            model=model_id,
+            host=str(ollama_host),
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+    if model_name == "llama":
+        try:
+            from pathlib import Path
+            import sys
+            PARENT_DIR = Path(__file__).resolve().parents[1]
+            sys.path.insert(0, str(PARENT_DIR))
+            from models_query.llama_query import Llama_Query
+
+        except Exception as e:
+            raise RuntimeError("Impossible d'importer Llama_Query.") from e
+
+        return Llama_Query(
+            model=model_id,
+            host=str(ollama_host),
+            max_retries=5,
+            retry_backoff_s=1.0,
+        )
+
+    raise ValueError(f"Unknown model_name: {model_name}")
+
+
+# -------------------------
+# Main
+# -------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--models", type=str, default="gpt")
+    parser.add_argument(
+        "--ollama_host",
+        type=str,
+        default=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+    )
+    parser.add_argument("--input_csv", type=str, default="../data/filtered_sp500_data.csv")
+    parser.add_argument("--start", type=str, default="2014-01-01")
+    parser.add_argument("--end", type=str, default="2025-06-30")
+    parser.add_argument("--n_samples", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--lookback_months", type=int, default=12)
+    parser.add_argument("--overwrite", action="store_true", help="Recompute months even if output json exists.")
+
+    # Distinct output location and distinct response names.
+    parser.add_argument("--output_dir", type=str, default="responses_returns_metadata_only")
+    parser.add_argument("--output_tag", type=str, default="returns_metadata_only")
+
+    args = parser.parse_args()
+
+    model_name = str(args.models).strip().lower()
+    if model_name not in MODEL_MAP:
+        raise ValueError(f"Unknown model_name: {model_name}. Supported: {sorted(MODEL_MAP)}")
+
+    model_id = MODEL_MAP[model_name]
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    llm = build_llm_client(
+        model_name=model_name,
+        model_id=model_id,
+        ollama_host=str(args.ollama_host),
+    )
+
+    # Load data
+    sp500_table = pd.read_csv(args.input_csv, low_memory=False)
+
+    required_cols = {
+        "year",
+        "month",
+        "stock_ret",
+        "char_date",
+        "tic",
+        "conm",
+        "gics_sector_name",
+        "gics",
+        "sic",
+        "naics",
+        "market_equity",
+    }
+    missing_cols = required_cols - set(sp500_table.columns)
+    if missing_cols:
+        raise ValueError(f"Input CSV missing required columns: {sorted(missing_cols)}")
+
+    # Robust types
+    sp500_table["year"] = pd.to_numeric(sp500_table["year"], errors="coerce").astype("Int64")
+    sp500_table["month"] = pd.to_numeric(sp500_table["month"], errors="coerce").astype("Int64")
+    sp500_table["stock_ret"] = pd.to_numeric(sp500_table["stock_ret"], errors="coerce")
+    sp500_table["market_equity"] = pd.to_numeric(sp500_table["market_equity"], errors="coerce")
+
+    sp500_table["decision_date"] = parse_yyyymmdd_int_to_datetime(sp500_table["char_date"])
+    sp500_table = sp500_table.dropna(subset=["decision_date", "tic"]).copy()
+
+    # Month key for decision month
+    sp500_table["ym"] = sp500_table["decision_date"].dt.to_period("M")
+    sp500_table["tic"] = normalize_ticker_series(sp500_table["tic"])
+
+    # Shift by 1 month per ticker so past_returns are strictly before the decision month.
+    sp500_table = sp500_table.sort_values(["tic", "ym", "decision_date"])
+    sp500_table["realized_ret"] = sp500_table.groupby("tic")["stock_ret"].shift(1)
+
+    start_dt = pd.to_datetime(args.start)
+    end_dt = pd.to_datetime(args.end)
+    month_starts = pd.date_range(start=start_dt, end=end_dt, freq="MS")
+
+    system_prompt = make_system_prompt_returns_metadata_only()
+
+    for month_start_dt in tqdm(month_starts, total=len(month_starts)):
+        month_end_dt = month_start_dt + pd.offsets.MonthEnd(1)
+        month_start = month_start_dt.strftime("%Y-%m-%d")
+        month_end = month_end_dt.strftime("%Y-%m-%d")
+
+        out_path = output_dir / f"{model_name}_{args.output_tag}_{month_start}_{month_end}.json"
+        if out_path.exists() and not args.overwrite:
+            continue
+
+        # Current month snapshot
+        current_p = month_start_dt.to_period("M")
+        mdf = sp500_table.loc[sp500_table["ym"] == current_p].copy()
+
+        if mdf.empty:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            continue
+
+        # Lookback history for returns list per ticker
+        lb = max(int(args.lookback_months), 1)
+        hist_start_p = current_p - (lb - 1)
+        hdf = sp500_table.loc[
+            (sp500_table["ym"] >= hist_start_p) & (sp500_table["ym"] <= current_p),
+            ["ym", "tic", "realized_ret"],
+        ].copy()
+
+        hdf = hdf.dropna(subset=["realized_ret"])
+        hdf = hdf.sort_values(["tic", "ym"])
+        hist_map = hdf.groupby("tic")["realized_ret"].apply(list).to_dict()
+
+        data_dict: dict[str, dict] = {}
+
+        for tic, g in mdf.groupby("tic", sort=False):
+            g = g.sort_values("decision_date")
+            last = g.iloc[-1]
+            past_returns = hist_map.get(tic, [])
+
+            market_equity = last.get("market_equity")
+            market_equity = float(market_equity) if pd.notna(market_equity) else None
+
+            row = {
+                "company_name": last.get("conm", ""),
+                "gics_sector_name": last.get("gics_sector_name", ""),
+                "gics": last.get("gics", ""),
+                "sic": last.get("sic", ""),
+                "naics": last.get("naics", ""),
+                "market_equity": market_equity,
+                "past_returns": [float(x) for x in past_returns if pd.notna(x)],
+            }
+
+            data_dict[tic] = row
+
+        # Query LLM per ticker
+        for ticker in tqdm(
+            list(data_dict.keys()),
+            desc=f"{model_id} no_text {month_start}->{month_end}",
+            leave=False,
+        ):
+            user_prompt = make_user_prompt_returns_metadata_only(ticker, data_dict[ticker])
+
+            res = llm.sample_expected_return(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                n_samples=int(args.n_samples),
+                temperature=float(args.temperature),
+            )
+
+            data_dict[ticker]["expected_return"] = res.samples
+            data_dict[ticker]["n_success"] = int(res.n_success)
+            data_dict[ticker]["expected_return_mean"] = res.mean
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data_dict, f, default=json_default)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,12 +1,11 @@
 - Ajouter utilisation de série temporelle de taux sans risque US, au lieu d'une constante x
 - Ajouter d'autres modèles LLM x
 - S'assurer que l'optimisation faite dans baselines pour MVO est cohérente par rapport à BL x
-- Ajouter un portefeuille market equilibrium (BL sans vues de marché pour comparer la valeur ajoutée des vues générées par LLM) x (à enlever)
 - Ajouter un portefeuille BL multi-llm
 - Faire une variante sans données textuelles (seulement suite de rendements comme papier original pour voir valeur ajoutée des données textuelles)
-- request de réduire structure dans le code, plus straight forward
 
 - Ajouter métriques de perf: CAGR, VaR95%, CondVaR95% x
+- Ajouter information ratio x 
 - Analyse des vues proposées par les LLMs
 
 - Perspectives futures: ajouter informations macro aux LLM, ajouter prédiction de tendance (mode) de consommation.
