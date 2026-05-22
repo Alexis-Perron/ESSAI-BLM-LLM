@@ -30,10 +30,10 @@ def main() -> None:
         type=str,
         default=os.getenv("OLLAMA_HOST", "http://localhost:11434")
     )
-    parser.add_argument("--input_csv", type=str, default="data/filtered_sp500_data.csv")
+    parser.add_argument("--input_csv", type=str, default="data/filtered_sp25_data.csv")
     parser.add_argument("--start", type=str, default="2014-01-01")
     parser.add_argument("--end", type=str, default="2025-06-30")
-    parser.add_argument("--n_samples", type=int, default=5)
+    parser.add_argument("--n_samples", type=int, default=30)
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--lookback_months", type=int, default=12)
     parser.add_argument("--overwrite", action="store_true", help="Recompute months even if output json exists.")

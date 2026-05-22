@@ -3,6 +3,7 @@ __pycache__/keys.cpython-313.pyc
 __pycache__/keys.cpython-311.pyc
 filtered_sp500_data.csv
 yfinance
+no_textual_data_version
 results
 responses_portfolios
 sp500-master

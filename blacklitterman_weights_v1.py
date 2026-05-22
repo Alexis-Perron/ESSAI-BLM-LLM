@@ -200,82 +200,113 @@ def black_litterman_no_views(
     return w_full
 
 # -------------------------
-# Equilibrium returns (robust beta calc)
+# Market-implied equilibrium returns
 # -------------------------
-def compute_market_equilibrium_returns(
+def compute_market_implied_equilibrium_returns(
     returns_df: pd.DataFrame,
     market_caps: Dict[str, float],
     risk_free_monthly: pd.Series | None = None,
+    market_risk_aversion: float = 2.5,
+    estimate_market_risk_aversion: bool = False,
     debug_tag: str = "",
-) -> Tuple[List[str], np.ndarray]:
+) -> Tuple[List[str], np.ndarray, np.ndarray]:
     """
-    CAPM-like equilibrium:
-      - cap-weighted market return from returns_df using market_caps
-      - betas vs market computed robustly (requires >=2 observations per ticker)
-      - pi = beta * market_risk_premium
+    Classical Black-Litterman market-implied prior:
 
-    Avoids RuntimeWarnings (ddof<=0, divide by zero).
-    Optionally prints tickers with insufficient data.
+        pi = delta * Sigma * w_mkt
+
+    where:
+      - Sigma is estimated from trailing monthly returns.
+      - w_mkt is the cap-weighted market portfolio using market_equity.
+      - delta is the market risk-aversion coefficient.
+
+    By default, delta is fixed with --market_risk_aversion.
+    If --estimate_market_risk_aversion is passed, delta is estimated as:
+
+        delta_hat = mean(R_m - R_f) / var(R_m)
+
+    If the estimated delta is not finite or non-positive, the function falls back
+    to the fixed market_risk_aversion value.
     """
-    caps_s = pd.Series({_normalize_ticker(k): v for k, v in market_caps.items()}, dtype=float).dropna()
+    # Keep only positive, finite market caps
+    caps_s = pd.Series(
+        {_normalize_ticker(k): v for k, v in market_caps.items()},
+        dtype=float,
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    caps_s = caps_s[caps_s > 0]
+
     common = [t for t in returns_df.columns if t in caps_s.index]
     if len(common) < 2:
-        raise ValueError("Not enough tickers after intersecting returns with market caps.")
+        raise ValueError("Not enough tickers after intersecting returns with positive market caps.")
 
+    # Keep tickers with enough observations for covariance estimation
+    obs = returns_df[common].notna().sum(axis=0)
+    common = [t for t in common if int(obs.get(t, 0)) >= 2]
+    if len(common) < 2:
+        raise ValueError("Not enough tickers with >=2 return observations for market-implied prior.")
+
+    returns_used = returns_df[common].copy()
     caps_s = caps_s.loc[common]
+
+    # Cap-weighted market portfolio
     w_mkt = caps_s / caps_s.sum()
+    w_mkt_v = w_mkt.to_numpy(dtype=float)
 
-    # cap-weighted market return
-    mkt = (returns_df[common].mul(w_mkt, axis=1)).sum(axis=1)
+    # Covariance matrix aligned with common tickers
+    sigma = _robust_covariance_psd(returns_used)
 
-    # Dynamic risk-free (monthly) aligned to market series.
-    # If not provided, we fallback to 0 (should not happen in normal runs).
-    if risk_free_monthly is None:
-        rf_series = pd.Series(0.0, index=mkt.index, dtype=float)
-    else:
-        rf_series = risk_free_monthly.reindex(mkt.index).astype(float).ffill().bfill()
+    # Choose delta
+    delta = float(market_risk_aversion)
 
-    mkt_valid = mkt.dropna()
-    if mkt_valid.shape[0] < 2:
-        msg = f"{debug_tag} Market series has <2 valid observations."
-        raise ValueError(msg)
+    if estimate_market_risk_aversion:
+        # Cap-weighted market return over the same trailing window
+        mkt = returns_used.mul(w_mkt, axis=1).sum(axis=1).dropna()
 
-    mkt_var = float(mkt_valid.var(ddof=1))
-    if (not np.isfinite(mkt_var)) or mkt_var <= 1e-18:
-        msg = f"{debug_tag} Market variance is zero/NaN; cannot compute betas."
-        raise ValueError(msg)
+        if risk_free_monthly is None:
+            rf_series = pd.Series(0.0, index=mkt.index, dtype=float)
+        else:
+            rf_series = risk_free_monthly.reindex(mkt.index).astype(float).ffill().bfill()
 
-    betas = pd.Series(index=returns_df.columns, dtype=float)
-    insufficient_tickers: List[str] = []
+        mkt_var = float(mkt.var(ddof=1))
+        mkt_excess_mean = float((mkt - rf_series.loc[mkt.index]).mean())
 
-    for t in returns_df.columns:
-        x = returns_df[t]
-        xy = pd.concat([x, mkt], axis=1).dropna()
-        if xy.shape[0] < 2:
-            betas.loc[t] = 0.0
-            insufficient_tickers.append(t)
-            continue
+        delta_hat = mkt_excess_mean / mkt_var if mkt_var > 1e-18 else np.nan
 
-        cov_tm = float(xy.iloc[:, 0].cov(xy.iloc[:, 1], ddof=1))
-        if not np.isfinite(cov_tm):
-            betas.loc[t] = 0.0
-            insufficient_tickers.append(t)
-            continue
+        if np.isfinite(delta_hat) and delta_hat > 0:
+            delta = float(delta_hat)
+        else:
+            print(
+                f"{debug_tag} estimated delta invalid ({delta_hat}); "
+                f"falling back to fixed delta={market_risk_aversion}."
+            )
 
-        betas.loc[t] = cov_tm / mkt_var
+    # Market-implied equilibrium excess returns
+    pi = float(delta) * (sigma @ w_mkt_v)
 
-    # Report tickers with insufficient data
-    if insufficient_tickers:
-        print(
-            f"{debug_tag} beta: insufficient data for {len(insufficient_tickers)} tickers -> betas set to 0."
-        )
-    mkt_rp = float((mkt_valid - rf_series.loc[mkt_valid.index]).mean())
-    pi = (betas.fillna(0.0) * mkt_rp).to_numpy(dtype=float)
-    return list(returns_df.columns), pi
+    if not np.isfinite(pi).all():
+        raise ValueError("Market-implied prior contains NaN/inf values.")
+
+    # Also return w_mkt_v so the no-view BL case can exactly match the
+    # cap-weighted market portfolio that generated the implied prior.
+    return common, pi, w_mkt_v
 
 # -------------------------
 # Period processing
 # -------------------------
+def _is_no_view_model(model_name: str) -> bool:
+    """
+    Returns True when the user explicitly asks for a Black-Litterman run
+    with no views.
+
+    Accepted CLI values include:
+      --models None
+      --models none
+      --models null
+      --models no_views
+    """
+    return str(model_name).strip().lower() in {"none", "null", "no_views", "noviews"}
+
+
 def process_period_for_model(
     model_name: str,
     start_date: str,
@@ -284,22 +315,39 @@ def process_period_for_model(
     dataset_df: pd.DataFrame,
     responses_dir: str,
     rf_monthly_annual: pd.Series,
-    min_tickers: int = 25,
+    min_tickers: int = 15,
+    market_risk_aversion: float = 2.5,
+    estimate_market_risk_aversion: bool = False,
 ) -> pd.Series:
     """
     For a given period and model:
       - build *monthly* trailing-window returns matrix directly from filtered_sp500_data.csv (stock_ret)
-      - load LLM responses json (unless model is None)
+      - load LLM responses json when model_name is a real LLM model
+      - skip LLM responses when model_name is None/null/no_views
       - load market caps snapshot from filtered_sp500_data.csv (month=end_date)
-      - compute equilibrium returns (robust)
-      - compute BL weights (LLM views) or BL weights with no views for model=None
+      - compute market-implied equilibrium returns pi = delta * Sigma * w_mkt
+      - compute BL weights with LLM views, or BL weights without views when model_name=None
+
+    Important:
+      - With no views, BL posterior expected returns reduce to the market-implied
+        equilibrium returns pi. The script then runs the same long-only MVO step
+        using pi and the covariance matrix.
     """
+    no_views = _is_no_view_model(model_name)
+
     market_caps = load_market_caps_from_dataset(dataset_df, end_date)
 
-    # Special case: model == None  -> Black-Litterman without views (posterior mean = equilibrium pi)
-    if str(model_name).strip().lower() in {"none", "null"}:
-        returns_df = load_returns_window_from_dataset(dataset_df, window_end_date=end_date, lookback_months=LOOKBACK_MONTHS, tickers=None)
-        # No LLM responses needed; use the full returns universe as-is.
+    if no_views:
+        # No response JSON is needed. We use the full universe available in the
+        # trailing returns window, then compute the market-implied prior from the
+        # tickers that also have positive market caps at end_date.
+        good_resp = None
+        returns_df = load_returns_window_from_dataset(
+            dataset_df,
+            window_end_date=end_date,
+            lookback_months=LOOKBACK_MONTHS,
+            tickers=None,
+        )
     else:
         resp_path = Path(responses_dir) / f"{model_name}_{start_date}_{end_date}.json"
         if not resp_path.exists():
@@ -310,7 +358,12 @@ def process_period_for_model(
         if len(good_resp) < 2:
             raise ValueError("Model responses contain <2 usable tickers.")
 
-        returns_df = load_returns_window_from_dataset(dataset_df, window_end_date=end_date, lookback_months=LOOKBACK_MONTHS, tickers=list(good_resp.keys()))
+        returns_df = load_returns_window_from_dataset(
+            dataset_df,
+            window_end_date=end_date,
+            lookback_months=LOOKBACK_MONTHS,
+            tickers=list(good_resp.keys()),
+        )
 
     if returns_df.shape[0] < int(MIN_RET_ROWS):
         raise ValueError(
@@ -318,9 +371,12 @@ def process_period_for_model(
             f"Increase LOOKBACK_MONTHS or check dataset coverage."
         )
 
-    if str(model_name).strip().lower() not in {"none", "null"}:
-        # Restrict returns to tickers available in responses (already filtered),
-        # but also ensure we have at least 2 overlapping tickers with data.
+    if returns_df.shape[1] < 2:
+        raise ValueError("Returns window contains <2 usable tickers.")
+
+    if not no_views:
+        # Restrict returns to tickers available in responses, but also ensure we
+        # have at least two overlapping tickers with data.
         common_cols = [c for c in returns_df.columns if c in good_resp]
         if len(common_cols) < 2:
             raise ValueError("Not enough overlapping tickers between returns and model responses.")
@@ -332,21 +388,29 @@ def process_period_for_model(
     # Align dynamic risk-free to the monthly returns index (convert annual yield -> monthly rate)
     rf_monthly = align_monthly_rf_to_returns_index(rf_monthly_annual, returns_df.index)
 
-    tickers_all, pi = compute_market_equilibrium_returns(
+    tickers_all, pi, w_mkt = compute_market_implied_equilibrium_returns(
         returns_df=returns_df,
         market_caps=market_caps,
         risk_free_monthly=rf_monthly,
+        market_risk_aversion=float(market_risk_aversion),
+        estimate_market_risk_aversion=bool(estimate_market_risk_aversion),
         debug_tag=f"[{model_name}] {start_date}->{end_date}",
     )
 
-    if str(model_name).strip().lower() in {"none", "null"}:
-        w = black_litterman_no_views(
-            returns_df=returns_df,
-            tickers=tickers_all,
-            market_equilibrium_return=pi,
-            tau=tau,
-            risk_aversion=0.1,
-        )
+    # Keep returns matrix aligned with the prior tickers returned by the market-implied calculation.
+    returns_df = returns_df[tickers_all].copy()
+
+    if no_views:
+        # With a market-implied prior and no views, BL posterior weights should
+        # equal the market portfolio used to infer pi. Returning w_mkt directly
+        # avoids accidentally turning the no-view benchmark into a minimum-variance
+        # or arbitrary MVO portfolio because of a different optimizer risk_aversion.
+        w = np.asarray(w_mkt, dtype=float).copy()
+        s = float(np.sum(w))
+        if not np.isfinite(s) or s <= 0:
+            w = np.ones(len(tickers_all), dtype=float) / max(1, len(tickers_all))
+        else:
+            w = w / s
     else:
         w = black_litterman_LLM(
             data_dict=good_resp,
@@ -364,16 +428,20 @@ def process_period_for_model(
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models", nargs="+", default=["gpt"], help="e.g. --models gpt gemma3 qwen")
+    parser.add_argument("--models", nargs="+", default=["gpt"], help="e.g. --models gpt gemma3 qwen None  (None = BL without views)")
     parser.add_argument("--tau", type=float, default=0.025)
     parser.add_argument("--start", type=str, default="2015-01-01")
     parser.add_argument("--end", type=str, default="2025-06-30")
     parser.add_argument("--responses_dir", type=str, default="responses")
-    parser.add_argument("--dataset_csv", type=str, default="data/filtered_sp500_data.csv")
+    parser.add_argument("--dataset_csv", type=str, default="data/filtered_sp25_data.csv")
     parser.add_argument("--results_dir", type=str, default="results")
 
     parser.add_argument("--risk_free_csv", type=str, default="data/DGS1.csv", help="CSV with risk-free yield series (e.g., FRED DGS1 export).")
-    parser.add_argument("--min_tickers", type=int, default=25)
+    parser.add_argument("--min_tickers", type=int, default=15)
+    parser.add_argument("--market_risk_aversion", type=float, default=1.0,
+                        help="Delta used in market-implied prior: pi = delta * Sigma * w_mkt.")
+    parser.add_argument("--estimate_market_risk_aversion", action="store_true",
+                        help="Estimate delta as mean(R_m - R_f) / var(R_m); fallback to --market_risk_aversion if invalid.")
 
     args = parser.parse_args()
 
@@ -386,8 +454,12 @@ def main():
     periods = month_pairs(args.start, args.end)
 
     for model in args.models:
-        model = model.strip()
-        print(f"\n=== Evaluating model: {model} | tau={args.tau} | {args.start} -> {args.end} ===")
+        model = str(model).strip()
+        no_views = _is_no_view_model(model)
+        model_out_name = "none" if no_views else model
+
+        view_label = "no views" if no_views else "LLM views"
+        print(f"\n=== Evaluating model: {model} ({view_label}) | market-implied prior | tau={args.tau} | delta={args.market_risk_aversion} | {args.start} -> {args.end} ===")
 
         results = {}  # (start,end) -> Series weights
         for start_date, end_date in tqdm(periods, desc=f"{model} periods"):
@@ -401,6 +473,8 @@ def main():
                     responses_dir=args.responses_dir,
                     rf_monthly_annual=rf_monthly_annual,
                     min_tickers=int(args.min_tickers),
+                    market_risk_aversion=float(args.market_risk_aversion),
+                    estimate_market_risk_aversion=bool(args.estimate_market_risk_aversion),
                 )
                 results[(start_date, end_date)] = w
             except Exception as e:
@@ -429,7 +503,7 @@ def main():
         df["Date"] = df["start_date"]  # keep compatibility with downstream scripts
         df = df.drop(columns=["start_date", "end_date"])
 
-        out_path = Path(args.results_dir) / f"{model}_black_litterman_weights_tau_{args.tau}.csv"
+        out_path = Path(args.results_dir) / f"{model_out_name}_black_litterman_market_implied_weights_tau_{args.tau}.csv"
         df.to_csv(out_path, index=False)
         print(f"[{model}] Saved weights: {out_path} | shape={df.shape}")
 

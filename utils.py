@@ -469,10 +469,18 @@ def pivot_monthly_returns(monthly_panel: pd.DataFrame) -> pd.DataFrame:
     return R
 
 
-def optimize_mean_variance(train_R: pd.DataFrame, lambda_param: float = 0.1) -> np.ndarray:
+def optimize_mean_variance(
+    train_R: pd.DataFrame,
+    lambda_param: float = 0.1,
+    long_only: bool = True,
+) -> np.ndarray:
     """
     Minimize: w' Σ w - lambda * (μ' w)
-    s.t. sum(w)=1 and w>=0 
+
+    Constraints:
+      - sum(w) = 1
+      - if long_only=True: 0 <= w_i <= 1
+      - if long_only=False: shorting allowed, with loose bounds
     """
     mu = train_R.mean(skipna=True)
     Sigma = train_R.cov()
@@ -480,8 +488,11 @@ def optimize_mean_variance(train_R: pd.DataFrame, lambda_param: float = 0.1) -> 
     mu_v = mu.to_numpy(dtype=float)
     S = Sigma.to_numpy(dtype=float)
 
+    if not np.isfinite(mu_v).all():
+        raise RuntimeError("Mean returns contain NaN/inf.")
+
     if not np.isfinite(S).all():
-        raise RuntimeError("Covariance contains NaN/inf (too few obs or too many missing values).")
+        raise RuntimeError("Covariance contains NaN/inf.")
 
     n = len(mu_v)
 
@@ -491,18 +502,36 @@ def optimize_mean_variance(train_R: pd.DataFrame, lambda_param: float = 0.1) -> 
         return port_risk - (lambda_param * port_ret)
 
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-    bounds = [(0.0, 1.0) for _ in range(n)]
+
+    if long_only:
+        bounds = [(0.0, 1.0) for _ in range(n)]
+    else:
+        bounds = [(-1.0, 1.0) for _ in range(n)]
+
     w0 = np.full(n, 1.0 / n)
 
-    res = minimize(objective, w0, method="SLSQP", bounds=bounds, constraints=constraints)
+    res = minimize(
+        objective,
+        w0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 1000}
+    )
+
     if (not res.success) or (not np.isfinite(res.x).all()):
         raise RuntimeError(res.message)
 
-    w = res.x
+    w = res.x.astype(float)
 
-    w = np.clip(w, 0.0, None)
+    if long_only:
+        w = np.clip(w, 0.0, None)
+
     s = w.sum()
-    return w / s if s != 0 else np.full(n, 1.0 / n)
+    if abs(s) < 1e-12:
+        return np.full(n, 1.0 / n)
+
+    return w / s
 
 
 def _month_starts_inclusive(start: str, end: str) -> pd.DatetimeIndex:
