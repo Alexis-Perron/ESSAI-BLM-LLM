@@ -1,25 +1,48 @@
+"""
+Compute monthly portfolio returns from Black-Litterman weight CSV files.
+
+Default convention:
+  - weights at month M are applied to returns in month M+1
+  - no transaction cost is charged on the first allocation
+  - transaction costs are charged on later rebalances at 0.001 * turnover
+"""
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+
 import numpy as np
 import pandas as pd
 
 from utils import (
     _clean_ticker,
+    _get_monthly_returns_series,
     _month_starts_between,
     _normalize_weights_columns,
     _parse_dataset_dates,
-    _get_monthly_returns_series,
 )
-
 
 WEIGHTS_MIDDLE = "_black_litterman_market_implied_weights_tau_"
 RETURNS_MIDDLE = "_black_litterman_implied_weights_returns_tau_"
+DEFAULT_TRANSACTION_COST_RATE = 0.001
 
 
-# -------------------------
-# File discovery helpers
-# -------------------------
+def _format_portfolio_risk_aversion(value: float | str) -> str:
+    try:
+        return f"{float(value):g}"
+    except Exception:
+        return str(value).strip().replace(" ", "_")
+
+
+def _resolve_results_dir(results_dir: str | Path, portfolio_risk_aversion: float | str | None) -> Path:
+    base = Path(results_dir)
+    if portfolio_risk_aversion is None:
+        return base
+
+    subdir = f"portfolio_risk_aversion_{_format_portfolio_risk_aversion(portfolio_risk_aversion)}"
+    return base if base.name == subdir else base / subdir
+
+
 def _weight_suffix(tau: float | str) -> str:
     return f"{WEIGHTS_MIDDLE}{tau}.csv"
 
@@ -29,213 +52,156 @@ def _returns_filename(portfolio_id: str, tau: float | str, start_date: str, end_
 
 
 def _portfolio_id_from_weights_file(path: Path, tau: float | str) -> str:
-    """Extract portfolio id from '{portfolio_id}_black_litterman_market_implied_weights_tau_{tau}.csv'."""
-    name = path.name
     suffix = _weight_suffix(tau)
-    if name.endswith(suffix):
-        return name[: -len(suffix)]
-    # fallback: remove extension only
-    return path.stem
+    if not path.name.endswith(suffix):
+        raise ValueError(f"Unexpected weights filename: {path.name}")
+    return path.name[: -len(suffix)]
 
 
-def discover_weight_files_for_model(
-    model_name: str,
-    tau: float | str,
-    results_dir: str = "results",
-    include_variants: bool = True,
-) -> List[Path]:
-    """
-    Discover all BL weight files compatible with a requested model name.
-
-    Examples if model_name='gpt':
-      - old/original: results/gpt_black_litterman_market_implied_weights_tau_0.025.csv
-      - new variants: results/gpt_omega_x25_black_litterman_market_implied_weights_tau_0.025.csv
-                      results/gpt_blend_alpha_0.5_omega_1_black_litterman_market_implied_weights_tau_0.025.csv
-
-    Matching is case-insensitive, but returned paths preserve actual file names.
-    """
-    results_path = Path(results_dir)
-    suffix = _weight_suffix(tau)
-    model_clean = str(model_name).strip()
-    model_lower = model_clean.lower()
-
-    if not model_clean:
+def discover_weight_files_for_model(model_name: str, tau: float | str, results_dir: str | Path) -> list[Path]:
+    model = str(model_name).strip().lower()
+    if not model:
         return []
 
-    all_weight_files = sorted(results_path.glob(f"*{suffix}"))
-    matched: List[Path] = []
+    results_path = Path(results_dir)
+    suffix = _weight_suffix(tau)
 
-    for p in all_weight_files:
-        pid = _portfolio_id_from_weights_file(p, tau)
-        pid_lower = pid.lower()
+    if model in {"none", "null", "no_views", "noviews"}:
+        model = "none"
 
-        # Exact old/original file: gpt_... or exact variant if user passes full id
-        is_exact = pid_lower == model_lower
-
-        # Variant files: gpt_omega_x25_..., gpt_blend_alpha_..., etc.
-        is_variant = pid_lower.startswith(model_lower + "_")
-
-        if is_exact or (include_variants and is_variant):
-            matched.append(p)
-
-    # Deduplicate while keeping sorted order
-    seen = set()
-    out = []
-    for p in matched:
-        key = str(p.resolve())
-        if key not in seen:
-            seen.add(key)
-            out.append(p)
-    return out
+    return sorted(results_path.glob(f"{model}*{suffix}"))
 
 
-# -------------------------
-# Dataset loading
-# -------------------------
-def load_dataset_month_groups(dataset_path: str) -> Dict[str, pd.DataFrame]:
-    """Load realized returns dataset once and return {YYYY-MM: dataframe for that month}."""
-    ds = pd.read_csv(dataset_path, low_memory=False)
-
-    ret_col = "stock_ret"
-    required = {"date", "tic", ret_col}
-    missing = required - set(ds.columns)
+def load_dataset_month_groups(dataset_path: str | Path) -> dict[str, pd.DataFrame]:
+    data = pd.read_csv(dataset_path, low_memory=False)
+    required = {"date", "tic", "stock_ret"}
+    missing = required - set(data.columns)
     if missing:
-        raise ValueError(f"Dataset is missing columns: {sorted(missing)}. Columns={list(ds.columns)[:30]}...")
+        raise ValueError(f"Dataset is missing columns: {sorted(missing)}")
 
-    ds["date"] = _parse_dataset_dates(ds["date"])
-    ds = ds.dropna(subset=["date"]).copy()
-    ds["tic"] = ds["tic"].astype(str).map(_clean_ticker)
-    ds = ds[ds["tic"] != ""].copy()
-    ds[ret_col] = pd.to_numeric(ds[ret_col], errors="coerce")
-    ds["ym"] = ds["date"].dt.to_period("M").astype(str)
+    data["date"] = _parse_dataset_dates(data["date"])
+    data = data.dropna(subset=["date"]).copy()
+    data["tic"] = data["tic"].astype(str).map(_clean_ticker)
+    data = data[data["tic"] != ""].copy()
+    data["stock_ret"] = pd.to_numeric(data["stock_ret"], errors="coerce")
+    data["ym"] = data["date"].dt.to_period("M").astype(str)
 
-    return dict(tuple(ds.groupby("ym", sort=False)))
+    return dict(tuple(data.groupby("ym", sort=False)))
 
 
-# -------------------------
-# Core computation
-# -------------------------
+def _normalize_weights(w: np.ndarray) -> np.ndarray:
+    w = np.nan_to_num(np.asarray(w, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    total = float(w.sum())
+    if not np.isfinite(total) or abs(total) < 1e-12:
+        return np.zeros_like(w, dtype=float)
+    return w / total
+
+
+def _calculate_transaction_cost(
+    current_weights: np.ndarray,
+    previous_weights: np.ndarray | None,
+    transaction_cost_rate: float,
+) -> tuple[float, float]:
+    rate = float(transaction_cost_rate or 0.0)
+    if rate <= 0.0 or previous_weights is None:
+        return 0.0, 0.0
+
+    current = _normalize_weights(current_weights)
+    previous = _normalize_weights(previous_weights)
+    turnover = float(np.sum(np.abs(current - previous)))
+    return turnover, float(rate * turnover)
+
+
 def calculate_returns_from_weights_file(
     weights_file: str | Path,
     portfolio_id: str,
     tau: float,
     start_date: str,
     end_date: str,
-    month_groups: Dict[str, pd.DataFrame],
-    results_dir: str = "results",
-    out_path: Optional[str] = None,
+    month_groups: dict[str, pd.DataFrame],
+    results_dir: str | Path,
     apply_next_month: bool = True,
-) -> Optional[pd.DataFrame]:
-    """
-    Compute portfolio returns from one BL weights file + realized returns.
-
-    Output format:
-      date_key, Portfolio_Return
-
-    apply_next_month:
-      - True  => weights month M applied to returns of month M+1
-      - False => weights month M applied to returns of month M
-    """
+    transaction_cost_rate: float = DEFAULT_TRANSACTION_COST_RATE,
+) -> pd.DataFrame | None:
     weights_file = Path(weights_file)
-    portfolio_id = str(portfolio_id).strip()
-
-    if out_path is None:
-        out_path = str(Path(results_dir) / _returns_filename(portfolio_id, tau, start_date, end_date))
-    out_path = str(out_path)
-
     if not weights_file.exists():
         return None
 
     weights_df = pd.read_csv(weights_file)
-
     if "Date" not in weights_df.columns:
-        raise ValueError(f"[{portfolio_id}] Weights file has no 'Date' column: {weights_file}")
+        raise ValueError(f"[{portfolio_id}] Weights file has no Date column: {weights_file}")
 
     weights_df["Date"] = pd.to_datetime(weights_df["Date"], errors="coerce")
-
     if weights_df["Date"].isna().all():
-        raise ValueError(f"[{portfolio_id}] Could not parse dates in weights file column 'Date'.")
+        raise ValueError(f"[{portfolio_id}] Could not parse dates in Date column.")
 
-    # Normalize weights dates to month-start
     weights_df["Date"] = weights_df["Date"].dt.to_period("M").dt.to_timestamp()
-
-    # Normalize / aggregate asset columns by cleaned ticker
     weights_df, asset_columns = _normalize_weights_columns(weights_df, date_col="Date")
 
-    month_starts = _month_starts_between(start_date, end_date)
-    out_rows = []
+    rows = []
+    previous_weights = None
 
-    for m0 in month_starts:
-        weight_date = m0.to_period("M").to_timestamp()
-
-        if apply_next_month:
-            target = (m0 + pd.offsets.MonthBegin(1)).to_period("M").to_timestamp()
-        else:
-            target = m0.to_period("M").to_timestamp()
-
-        target_ym = pd.Period(target, freq="M").strftime("%Y-%m")
+    for weight_month in _month_starts_between(start_date, end_date):
+        weight_date = weight_month.to_period("M").to_timestamp()
+        target_month = weight_month + pd.offsets.MonthBegin(1) if apply_next_month else weight_month
+        target_ym = pd.Period(target_month, freq="M").strftime("%Y-%m")
 
         if target_ym not in month_groups:
             continue
 
-        month_df = month_groups[target_ym]
-        r_series, month_end_date = _get_monthly_returns_series(
-            month_df=month_df,
-            ticker_col="tic",
-            date_col="date",
-            ret_col="stock_ret",
-        )
-
-        if r_series.empty or not np.isfinite(r_series.to_numpy(dtype=float)).any():
-            continue
-
-        # Select weights row for weight month
         row = weights_df.loc[weights_df["Date"] == weight_date]
         if row.empty:
             continue
 
-        w = row[asset_columns].iloc[0].to_numpy(dtype=float)
-        w = np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+        returns_series, month_end_date = _get_monthly_returns_series(
+            month_df=month_groups[target_ym],
+            ticker_col="tic",
+            date_col="date",
+            ret_col="stock_ret",
+        )
+        if returns_series.empty:
+            continue
 
-        # Align assets between weights and available returns
-        r = r_series.reindex(asset_columns).to_numpy(dtype=float)
-        finite = np.isfinite(r)
-
+        weights = row[asset_columns].iloc[0].to_numpy(dtype=float)
+        weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        returns = returns_series.reindex(asset_columns).to_numpy(dtype=float)
+        finite = np.isfinite(returns)
         if not finite.any():
             continue
 
-        w_f = w[finite]
-        r_f = r[finite]
+        weights_f = weights[finite]
+        returns_f = returns[finite]
+        denom = float(weights_f.sum())
+        if not np.isfinite(denom) or abs(denom) < 1e-12:
+            continue
 
-        eps = 1e-12
-        denom = float(np.sum(w_f))
-        if not np.isfinite(denom) or abs(denom) < eps:
-            abs_denom = float(np.sum(np.abs(w_f)))
-            if np.isfinite(abs_denom) and abs_denom >= eps:
-                denom = abs_denom
-                w_use = np.abs(w_f)
-            else:
-                denom = float(len(w_f))
-                w_use = np.ones_like(w_f, dtype=float)
-        else:
-            w_use = w_f
+        gross_return = float(np.sum(weights_f * returns_f) / denom)
+        turnover, transaction_cost = _calculate_transaction_cost(
+            current_weights=weights,
+            previous_weights=previous_weights,
+            transaction_cost_rate=transaction_cost_rate,
+        )
+        net_return = gross_return - transaction_cost
 
-        port_ret = float(np.sum(w_use * r_f) / denom)
-
-        out_rows.append(
+        rows.append(
             {
-                "date_key": month_end_date if pd.notna(month_end_date) else target,
-                "Portfolio_Return": port_ret,
+                "date_key": month_end_date if pd.notna(month_end_date) else target_month,
+                "Portfolio_Return": net_return,
+                "Gross_Portfolio_Return": gross_return,
+                "Turnover": turnover,
+                "Transaction_Cost": transaction_cost,
             }
         )
+        previous_weights = weights.copy()
 
-    if not out_rows:
+    if not rows:
         return None
 
-    out = pd.DataFrame(out_rows).sort_values("date_key").reset_index(drop=True)
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    out.to_csv(out_path, index=False)
-    return out
+    output = pd.DataFrame(rows).sort_values("date_key").reset_index(drop=True)
+    out_path = Path(results_dir) / _returns_filename(portfolio_id, tau, start_date, end_date)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    output.to_csv(out_path, index=False)
+    return output
 
 
 def calculate_model_returns(
@@ -245,198 +211,96 @@ def calculate_model_returns(
     end_date: str,
     dataset_path: str = "data/filtered_sp25_data.csv",
     results_dir: str = "results",
-    weights_path: Optional[str] = None,
-    out_path: Optional[str] = None,
     apply_next_month: bool = True,
-    include_variants: bool = True,
-) -> Dict[str, Optional[pd.DataFrame]]:
-    """
-    Backward-compatible wrapper.
-
-    If weights_path is provided, computes returns for that one file.
-    Otherwise, discovers every matching old/new BL weights file for model_name.
-
-    Returns a dict: {portfolio_id: dataframe_or_None}.
-    """
+    portfolio_risk_aversion: float | str | None = None,
+    transaction_cost_rate: float = DEFAULT_TRANSACTION_COST_RATE,
+) -> dict[str, pd.DataFrame | None]:
+    resolved_results_dir = _resolve_results_dir(results_dir, portfolio_risk_aversion)
     month_groups = load_dataset_month_groups(dataset_path)
+    outputs = {}
 
-    if weights_path is not None:
-        weights_file = Path(weights_path)
+    for weights_file in discover_weight_files_for_model(model_name, tau, resolved_results_dir):
         portfolio_id = _portfolio_id_from_weights_file(weights_file, tau)
-        if not portfolio_id or portfolio_id == weights_file.stem:
-            portfolio_id = str(model_name).strip().lower()
-        return {
-            portfolio_id: calculate_returns_from_weights_file(
-                weights_file=weights_file,
-                portfolio_id=portfolio_id,
-                tau=tau,
-                start_date=start_date,
-                end_date=end_date,
-                month_groups=month_groups,
-                results_dir=results_dir,
-                out_path=out_path,
-                apply_next_month=apply_next_month,
-            )
-        }
-
-    weight_files = discover_weight_files_for_model(
-        model_name=model_name,
-        tau=tau,
-        results_dir=results_dir,
-        include_variants=include_variants,
-    )
-
-    outputs: Dict[str, Optional[pd.DataFrame]] = {}
-    for wf in weight_files:
-        portfolio_id = _portfolio_id_from_weights_file(wf, tau)
         outputs[portfolio_id] = calculate_returns_from_weights_file(
-            weights_file=wf,
+            weights_file=weights_file,
             portfolio_id=portfolio_id,
             tau=tau,
             start_date=start_date,
             end_date=end_date,
             month_groups=month_groups,
-            results_dir=results_dir,
-            out_path=None,
+            results_dir=resolved_results_dir,
             apply_next_month=apply_next_month,
+            transaction_cost_rate=transaction_cost_rate,
         )
 
     return outputs
 
 
-# -------------------------
-# CLI
-# -------------------------
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compute portfolio returns from BL weights + dataset returns. "
-            "For each model, the script now discovers both old files and new variant files."
-        )
-    )
-    parser.add_argument("--models", nargs="+", required=True, help="List of model names or portfolio prefixes, e.g. gpt gemma3 llama qwen none.")
+    parser = argparse.ArgumentParser(description="Compute portfolio returns from BL weights.")
+    parser.add_argument("--models", nargs="+", required=True)
     parser.add_argument("--tau", type=float, default=0.025)
     parser.add_argument("--start_date", type=str, default="2015-01-01")
     parser.add_argument("--end_date", type=str, default="2025-06-30")
     parser.add_argument("--dataset_path", type=str, default="data/filtered_sp25_data.csv")
     parser.add_argument("--results_dir", type=str, default="results")
-    parser.add_argument("--weights_path", type=str, default=None, help="Optional explicit path to one weights CSV. Use only with one model.")
-    parser.add_argument("--out_path", type=str, default=None, help="Optional explicit output CSV path. Use only with one explicit weights file.")
-    parser.add_argument("--apply_next_month", action="store_true", help="Apply weights at month M to returns of month M+1. This is the default.")
-    parser.add_argument("--no_apply_next_month", action="store_true", help="Apply weights at month M to returns of month M.")
-    parser.add_argument("--exact_only", action="store_true", help="Only compute the exact old-style file for each model, not model_* variants.")
-    parser.add_argument("--list_only", action="store_true", help="Only list discovered weights files; do not compute returns.")
+    parser.add_argument("--portfolio_risk_aversion", type=str, default=None)
+    parser.add_argument("--transaction_cost_rate", type=float, default=DEFAULT_TRANSACTION_COST_RATE)
+    parser.add_argument("--same_month", action="store_true", help="Apply weights to same-month returns instead of next-month returns.")
     parser.add_argument("--quiet", action="store_true")
-
     args = parser.parse_args()
 
-    apply_next_month = True
-    if args.no_apply_next_month:
-        apply_next_month = False
-    elif args.apply_next_month:
-        apply_next_month = True
-
-    include_variants = not args.exact_only
-
-    if (args.weights_path is not None or args.out_path is not None) and len(args.models) != 1:
-        raise ValueError("--weights_path and --out_path can only be used when exactly one model is provided.")
-    if args.out_path is not None and args.weights_path is None:
-        raise ValueError("--out_path requires --weights_path, because multiple discovered files would otherwise map to one output path.")
-
-    # Discover files first, so the user can verify exactly what will be run.
-    explicit_mode = args.weights_path is not None
-
-    if args.list_only:
-        if explicit_mode:
-            print(Path(args.weights_path))
-            return
-        for m in args.models:
-            files = discover_weight_files_for_model(
-                model_name=m,
-                tau=args.tau,
-                results_dir=args.results_dir,
-                include_variants=include_variants,
-            )
-            print(f"\n[{m}] {len(files)} matching weights file(s):")
-            for f in files:
-                print(f"  - {f}")
-        return
-
+    results_dir = _resolve_results_dir(args.results_dir, args.portfolio_risk_aversion)
     month_groups = load_dataset_month_groups(args.dataset_path)
+    apply_next_month = not args.same_month
 
-    total_saved = 0
+    if not args.quiet:
+        print(f"Results directory: {results_dir}")
+        print(f"Transaction cost rate: {float(args.transaction_cost_rate):g}")
+        print("Initial transaction cost: 0")
 
-    if explicit_mode:
-        wf = Path(args.weights_path)
-        portfolio_id = _portfolio_id_from_weights_file(wf, args.tau)
-        if portfolio_id == wf.stem:
-            portfolio_id = str(args.models[0]).strip().lower()
-
-        out = calculate_returns_from_weights_file(
-            weights_file=wf,
-            portfolio_id=portfolio_id,
-            tau=args.tau,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            month_groups=month_groups,
-            results_dir=args.results_dir,
-            out_path=args.out_path,
-            apply_next_month=apply_next_month,
-        )
-        if not args.quiet:
-            if out is None:
-                print(f"[{portfolio_id}] No returns produced from {wf.name}.")
-            else:
-                print(f"[{portfolio_id}] Saved returns with {len(out)} rows from {wf.name}.")
-        return
-
-    # Normal multi-model / multi-variant mode
     seen_files = set()
-    for m in args.models:
-        weight_files = discover_weight_files_for_model(
-            model_name=m,
-            tau=args.tau,
-            results_dir=args.results_dir,
-            include_variants=include_variants,
-        )
+    saved = 0
 
+    for model in args.models:
+        weight_files = discover_weight_files_for_model(model, args.tau, results_dir)
         if not weight_files:
             if not args.quiet:
-                print(f"[{m}] No matching weights files found in {args.results_dir}.")
+                print(f"[{model}] No matching weights files found.")
             continue
 
         if not args.quiet:
-            print(f"\n[{m}] Found {len(weight_files)} matching weights file(s).")
+            print(f"\n[{model}] Found {len(weight_files)} weights file(s).")
 
-        for wf in weight_files:
-            key = str(wf.resolve())
+        for weights_file in weight_files:
+            key = str(weights_file.resolve())
             if key in seen_files:
                 continue
             seen_files.add(key)
 
-            portfolio_id = _portfolio_id_from_weights_file(wf, args.tau)
-            out = calculate_returns_from_weights_file(
-                weights_file=wf,
+            portfolio_id = _portfolio_id_from_weights_file(weights_file, args.tau)
+            output = calculate_returns_from_weights_file(
+                weights_file=weights_file,
                 portfolio_id=portfolio_id,
                 tau=args.tau,
                 start_date=args.start_date,
                 end_date=args.end_date,
                 month_groups=month_groups,
-                results_dir=args.results_dir,
-                out_path=None,
+                results_dir=results_dir,
                 apply_next_month=apply_next_month,
+                transaction_cost_rate=float(args.transaction_cost_rate),
             )
 
             if not args.quiet:
-                if out is None:
-                    print(f"  - [{portfolio_id}] No returns produced from {wf.name}.")
+                if output is None:
+                    print(f"  - [{portfolio_id}] No returns produced.")
                 else:
-                    total_saved += 1
-                    out_file = Path(args.results_dir) / _returns_filename(portfolio_id, args.tau, args.start_date, args.end_date)
-                    print(f"  - [{portfolio_id}] Saved {len(out)} rows -> {out_file.name}")
+                    saved += 1
+                    out_file = results_dir / _returns_filename(portfolio_id, args.tau, args.start_date, args.end_date)
+                    print(f"  - [{portfolio_id}] Saved {len(output)} rows -> {out_file.name}")
 
     if not args.quiet:
-        print(f"\nDone. Return files saved: {total_saved}")
+        print(f"\nDone. Return files saved: {saved}")
 
 
 if __name__ == "__main__":
